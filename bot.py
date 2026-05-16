@@ -189,18 +189,22 @@ async def load_clusters(user_id: int):
 
     clusters = {}
     for order in orders:
-        # Используем drop_off_warehouse.name как название кластера
-        warehouse = order.get("drop_off_warehouse", {})
-        cluster_name = warehouse.get("name", "Без кластера")
+        # Берём macrolocal_cluster_id из supplies
+        supplies = order.get("supplies", [])
+        cluster_id = None
+        if supplies:
+            cluster_id = str(supplies[0].get("macrolocal_cluster_id") or "")
+        if not cluster_id:
+            cluster_id = "unknown"
 
-        if cluster_name not in clusters:
-            clusters[cluster_name] = []
-        clusters[cluster_name].append(order)
+        if cluster_id not in clusters:
+            clusters[cluster_id] = []
+        clusters[cluster_id].append(order)
 
     # Сохраняем в кэш как список для индексации
     cluster_list = []
-    for cname, corders in clusters.items():
-        cluster_list.append({"id": cname, "orders": corders, "names": {}})
+    for cid, corders in clusters.items():
+        cluster_list.append({"id": cid, "orders": corders, "names": cluster_names})
 
     cluster_cache[user_id] = cluster_list
     return cluster_list
