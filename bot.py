@@ -80,26 +80,29 @@ async def get_data_filling_orders(session):
 
 
 async def get_cluster_names(session):
-    """Получить названия кластеров через /v1/cluster/list.
-    Структура: clusters[].logistic_clusters[] — строим маппинг обоих уровней.
-    """
+    """Получить названия кластеров. Строим маппинг всех уровней вложенности."""
+    result = {}
+
+    def extract_ids(obj, parent_name=""):
+        """Рекурсивно извлекаем все id → name из структуры"""
+        if isinstance(obj, dict):
+            cid  = str(obj.get("id") or obj.get("cluster_id") or "")
+            name = obj.get("name") or obj.get("cluster_name") or parent_name
+            if cid and name:
+                result[cid] = name
+                parent_name = name
+            for v in obj.values():
+                extract_ids(v, parent_name)
+        elif isinstance(obj, list):
+            for item in obj:
+                extract_ids(item, parent_name)
+
     try:
         data = await ozon_post(session, f"{OZON_API_URL}/v1/cluster/list", {
             "cluster_type": "CLUSTER_TYPE_OZON"
         })
-        result = {}
-        for macro in (data.get("clusters") or []):
-            macro_id   = str(macro.get("id") or "")
-            macro_name = macro.get("name") or macro_id
-            # Маппинг макро-кластера
-            if macro_id:
-                result[macro_id] = macro_name
-            # Маппинг вложенных логистических кластеров → имя макро
-            for lc in (macro.get("logistic_clusters") or []):
-                lc_id = str(lc.get("id") or "")
-                lc_name = lc.get("name") or macro_name  # если нет своего имени — берём имя макро
-                if lc_id:
-                    result[lc_id] = lc_name
+        logger.info(f"Cluster full response: {json.dumps(data)}")
+        extract_ids(data)
         logger.info(f"Cluster names map: {result}")
         return result
     except Exception as e:
