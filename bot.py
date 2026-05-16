@@ -148,7 +148,7 @@ async def process_reschedule() -> str:
             try:
                 current_date = get_current_order_date(order)
                 target_date = (current_date + timedelta(days=1)) if current_date else \
-                              (datetime.now(MOSCOW_TZ).date() + timedelta(days=1))
+                              (datetime.now(MOSCOW_TZ).date() + timedelta(days=14))
 
                 time_from = f"{target_date.strftime('%Y-%m-%d')}T16:00:00Z"
                 time_to   = f"{target_date.strftime('%Y-%m-%d')}T17:00:00Z"
