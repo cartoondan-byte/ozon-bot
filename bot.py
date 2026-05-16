@@ -213,63 +213,87 @@ async def load_clusters(user_id: int):
     return cluster_list
 
 
-async def get_cluster_details(user_id: int, cluster_idx: int) -> str:
-    """Получить детали заявок по кластеру с SKU"""
+async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
+    """Загрузить SKU для кластера. Возвращает {sku_id: {name, orders: [{order, qty, date}]}}"""
     cluster_list = cluster_cache.get(user_id)
     if not cluster_list or cluster_idx >= len(cluster_list):
-        return "❗ Данные устарели, нажми кнопку снова."
+        return {}
 
     cluster = cluster_list[cluster_idx]
-    cluster_id = cluster["id"]
     orders = cluster["orders"]
-    names = cluster.get("names", {})
-    cluster_display = names.get(str(cluster_id), f"Кластер {cluster_id}")
-
-    lines = [f"📍 {cluster_display}\n"]
+    sku_map = {}  # sku_id -> {name, offer_id, orders: [...]}
 
     async with aiohttp.ClientSession() as session:
         for order in orders:
             onum = order.get("order_number", "?")
-            state = order.get("state", "?")
-            state_name = STATE_NAMES.get(state, state)
-
-            # Дата отгрузки
             try:
                 from_str = order["timeslot"]["timeslot"]["from"]
                 dt = datetime.fromisoformat(from_str.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
                 date_str = dt.strftime("%d.%m.%Y %H:%M")
             except Exception:
-                date_str = "неизвестно"
+                date_str = "?"
 
-            lines.append(f"📋 Заявка {onum} | {state_name}")
-            lines.append(f"   📅 Дата отгрузки: {date_str}")
+            state = order.get("state", "?")
+            state_name = STATE_NAMES.get(state, state)
 
-            # Получаем bundle для SKU
             supplies = order.get("supplies", [])
-            if supplies:
-                bundle_id = supplies[0].get("bundle_id")
-                if bundle_id:
-                    bundle_data = await get_bundle_items(session, bundle_id)
-                    logger.info(f"Bundle keys: {list(bundle_data.keys())}, full: {json.dumps(bundle_data)[:500]}")
-                    # Ищем items во всех возможных ключах
-                    items = bundle_data.get("items") or bundle_data.get("products") or bundle_data.get("bundle_items") or []
-                    if not items and isinstance(bundle_data.get("result"), list):
-                        items = bundle_data["result"]
-                    elif not items and isinstance(bundle_data.get("result"), dict):
-                        items = bundle_data["result"].get("items", [])
+            if not supplies:
+                continue
+            bundle_id = supplies[0].get("bundle_id")
+            if not bundle_id:
+                continue
 
-                    if items:
-                        for item in items:
-                            name = (item.get("name") or item.get("product_name") or item.get("title") or "—")
-                            sku  = (item.get("sku") or item.get("product_id") or item.get("offer_id") or "—")
-                            qty  = (item.get("quantity") or item.get("qty") or item.get("count") or "—")
-                            lines.append(f"   🏷 {name}")
-                            lines.append(f"      SKU: {sku} | Кол-во: {qty}")
-                    else:
-                        lines.append(f"   ℹ️ Ключи bundle: {list(bundle_data.keys())}")
-            lines.append("")
+            bundle_data = await get_bundle_items(session, bundle_id)
+            items = bundle_data.get("items") or []
+
+            for item in items:
+                sku = str(item.get("sku") or item.get("product_id") or "")
+                if not sku:
+                    continue
+                name = item.get("name") or "—"
+                qty = item.get("quantity") or 0
+
+                if sku not in sku_map:
+                    sku_map[sku] = {"name": name, "orders": []}
+                sku_map[sku]["orders"].append({
+                    "order_number": onum,
+                    "date": date_str,
+                    "qty": qty,
+                    "state": state_name,
+                })
+
+    # Сохраняем в кэш
+    if user_id not in cluster_cache:
+        cluster_cache[user_id] = []
+    cluster_list[cluster_idx]["sku_map"] = sku_map
+    return sku_map
+
+
+def format_sku_detail(cluster_name: str, sku: str, sku_map: dict) -> str:
+    """Форматируем детали по конкретному SKU"""
+    info = sku_map.get(sku, {})
+    product_name = info.get("name", "—")
+    orders = info.get("orders", [])
+
+    total_qty = sum(o["qty"] for o in orders)
+    lines = [
+        f"📍 {cluster_name}",
+        f"🏷 {product_name}",
+        f"SKU: {sku}",
+        f"Всего единиц в заявках: {total_qty}",
+        "",
+    ]
+    for o in orders:
+        lines.append(f"📋 {o['order_number']} | {o['state']}")
+        lines.append(f"   📅 {o['date']} | {o['qty']} шт.")
+        lines.append("")
 
     return "\n".join(lines)
+
+
+async def get_cluster_details(user_id: int, cluster_idx: int) -> str:
+    """Заглушка — теперь не используется напрямую"""
+    return ""
 
 
 # ===== TELEGRAM =====
@@ -372,18 +396,91 @@ async def on_cluster_detail(callback: CallbackQuery):
     await callback.answer()
     idx = int(callback.data.split(":")[1])
     try:
-        await callback.message.edit_text("⏳ Загружаю данные кластера...")
+        await callback.message.edit_text("⏳ Загружаю SKU кластера...")
     except Exception:
-        pass  # Игнорируем "message not modified"
+        pass
     try:
-        text = await get_cluster_details(callback.from_user.id, idx)
-        if len(text) > 4000:
-            text = text[:4000] + "\n...(обрезано)"
-        await callback.message.edit_text(text, reply_markup=back_keyboard())
+        uid = callback.from_user.id
+        cluster_list = cluster_cache.get(uid, [])
+        if not cluster_list or idx >= len(cluster_list):
+            await callback.message.edit_text("❗ Данные устарели, нажми кнопку кластеров снова.")
+            return
+
+        cluster = cluster_list[idx]
+        cluster_id = cluster["id"]
+        names = cluster.get("names", {})
+        cluster_display = names.get(str(cluster_id), f"Кластер {cluster_id}")
+
+        sku_map = await load_cluster_skus(uid, idx)
+        if not sku_map:
+            await callback.message.edit_text(
+                f"📍 {cluster_display}\n\nℹ️ Нет SKU в заявках этого кластера.",
+                reply_markup=back_keyboard()
+            )
+            return
+
+        # Строим кнопки по SKU
+        buttons = []
+        for sku, info in sku_map.items():
+            name = info["name"]
+            total_qty = sum(o["qty"] for o in info["orders"])
+            # Укорачиваем название для кнопки
+            short_name = name[:30] + "..." if len(name) > 30 else name
+            buttons.append([InlineKeyboardButton(
+                text=f"{short_name} | {total_qty} шт.",
+                callback_data=f"sku:{idx}:{sku}"
+            )])
+        buttons.append([InlineKeyboardButton(text="◀️ К кластерам", callback_data="clusters")])
+        buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")])
+
+        order_count = len(cluster["orders"])
+        await callback.message.edit_text(
+            f"📍 {cluster_display}\n"
+            f"Заявок: {order_count} | SKU: {len(sku_map)}\n\n"
+            f"Выбери SKU для просмотра заявок:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
     except Exception as e:
         logger.exception("cluster detail error")
         try:
             await callback.message.edit_text(f"❗ Ошибка: {str(e)}", reply_markup=back_keyboard())
+        except Exception:
+            pass
+
+
+@dp.callback_query(F.data.startswith("sku:"))
+async def on_sku_detail(callback: CallbackQuery):
+    await callback.answer()
+    parts = callback.data.split(":")
+    cluster_idx = int(parts[1])
+    sku = parts[2]
+
+    try:
+        uid = callback.from_user.id
+        cluster_list = cluster_cache.get(uid, [])
+        if not cluster_list or cluster_idx >= len(cluster_list):
+            await callback.message.edit_text("❗ Данные устарели.")
+            return
+
+        cluster = cluster_list[cluster_idx]
+        cluster_id = cluster["id"]
+        names = cluster.get("names", {})
+        cluster_display = names.get(str(cluster_id), f"Кластер {cluster_id}")
+        sku_map = cluster.get("sku_map", {})
+
+        text = format_sku_detail(cluster_display, sku, sku_map)
+        if len(text) > 4000:
+            text = text[:4000] + "\n...(обрезано)"
+
+        back_to_cluster = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="◀️ К SKU кластера", callback_data=f"cluster:{cluster_idx}")],
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")],
+        ])
+        await callback.message.edit_text(text, reply_markup=back_to_cluster)
+    except Exception as e:
+        logger.exception("sku detail error")
+        try:
+            await callback.message.edit_text(f"❗ Ошибка: {str(e)}")
         except Exception:
             pass
 
