@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import json
 from datetime import datetime, timedelta
 import pytz
 import aiohttp
@@ -25,29 +26,35 @@ HEADERS = {
 
 # ===== OZON API =====
 
-async def get_supply_orders(session):
-    url = f"{OZON_API_URL}/v1/supply-order/list"
-    payload = {"paging": {"from_supply_order_id": 0, "limit": 50}, "filter": {}}
+async def ozon_post(session, url, payload):
+    """Универсальный метод для запросов к Ozon API с нормальной обработкой ошибок"""
     async with session.post(url, json=payload, headers=HEADERS) as resp:
-        data = await resp.json()
-        logger.info(f"supply-order/list: {data}")
-        return data.get("supply_orders", [])
+        text = await resp.text()
+        logger.info(f"POST {url} status={resp.status} body={text[:500]}")
+        if resp.status == 403:
+            raise Exception(f"Нет доступа (403). Проверь права API-ключа в Ozon Seller.")
+        if resp.status == 401:
+            raise Exception(f"Неверный API-ключ (401). Проверь Client-Id и Api-Key.")
+        if resp.status != 200:
+            raise Exception(f"Ozon API вернул ошибку {resp.status}: {text[:300]}")
+        try:
+            return json.loads(text)
+        except Exception:
+            raise Exception(f"Ozon API вернул не JSON: {text[:300]}")
+
+async def get_supply_orders(session):
+    data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/list",
+                           {"paging": {"from_supply_order_id": 0, "limit": 50}, "filter": {}})
+    return data.get("supply_orders", [])
 
 async def get_timeslots(session, supply_order_id, date_from, date_to):
-    url = f"{OZON_API_URL}/v1/supply-order/timeslot/list"
-    payload = {"supply_order_id": supply_order_id, "date_from": date_from, "date_to": date_to}
-    async with session.post(url, json=payload, headers=HEADERS) as resp:
-        data = await resp.json()
-        logger.info(f"timeslot/list for {supply_order_id}: {data}")
-        return data.get("timeslots", [])
+    data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/list",
+                           {"supply_order_id": supply_order_id, "date_from": date_from, "date_to": date_to})
+    return data.get("timeslots", [])
 
 async def update_timeslot(session, supply_order_id, timeslot_id):
-    url = f"{OZON_API_URL}/v1/supply-order/timeslot/update"
-    payload = {"supply_order_id": supply_order_id, "timeslot_id": timeslot_id}
-    async with session.post(url, json=payload, headers=HEADERS) as resp:
-        data = await resp.json()
-        logger.info(f"timeslot/update for {supply_order_id}: {data}")
-        return data
+    return await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/update",
+                           {"supply_order_id": supply_order_id, "timeslot_id": timeslot_id})
 
 # ===== ЛОГИКА =====
 
@@ -57,7 +64,6 @@ def is_target_status(status: str) -> bool:
     return not any(x in s for x in skip)
 
 def find_best_timeslot(timeslots: list):
-    # Сначала ищем 19:00
     for slot in timeslots:
         try:
             dt = datetime.fromisoformat(slot["from"].replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
@@ -137,7 +143,7 @@ async def process_orders() -> str:
         lines.extend(results)
     if errors:
         if results: lines.append("")
-        lines.append("Ошибки:")
+        lines.append("Проблемы:")
         lines.extend(errors)
 
     return "\n".join(lines)
