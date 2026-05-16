@@ -28,7 +28,7 @@ HEADERS = {
 
 async def ozon_post(session, url, payload, retry=3):
     for attempt in range(retry):
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         async with session.post(url, json=payload, headers=HEADERS) as resp:
             text = await resp.text()
             logger.info(f"POST {url} status={resp.status} body={text[:300]}")
