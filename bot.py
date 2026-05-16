@@ -294,8 +294,8 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
         """Получить bundle одной заявки (с семафором)"""
         async with _semaphore:
             onum = order.get("order_number", "?")
-            state_name = STATE_NAMES.get(order.get("state", ""), order.get("state", ""))
-            # Дата как объект для сортировки
+            raw_state = order.get("state", "")
+            state_name = STATE_NAMES.get(raw_state, raw_state)
             try:
                 from_str = order["timeslot"]["timeslot"]["from"]
                 ship_dt = datetime.fromisoformat(from_str.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
@@ -305,12 +305,12 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
             supplies = order.get("supplies", [])
             bundle_id = supplies[0].get("bundle_id") if supplies else None
             if not bundle_id:
-                return onum, ship_dt, state_name, []
+                return onum, ship_dt, state_name, raw_state, []
 
             bundle_data = await get_bundle_items_fast(session, bundle_id)
             items = bundle_data.get("items") or []
-            logger.info(f"Bundle {onum}: {len(items)} items, keys={list(bundle_data.keys())}")
-            return onum, ship_dt, state_name, items
+            logger.info(f"Bundle {onum}: {len(items)} items")
+            return onum, ship_dt, state_name, raw_state, items
 
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(
