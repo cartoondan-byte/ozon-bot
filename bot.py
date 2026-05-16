@@ -79,13 +79,33 @@ async def get_data_filling_orders(session):
     return [o for o in orders if o.get("state") == "DATA_FILLING"]
 
 
+async def get_cluster_names(session):
+    """Получить названия кластеров"""
+    try:
+        data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/cluster/list", {})
+        logger.info(f"Cluster list: {json.dumps(data)[:500]}")
+        # Строим словарь id -> name
+        clusters = {}
+        for c in data.get("clusters", data.get("result", [])):
+            cid = str(c.get("id") or c.get("cluster_id") or "")
+            name = c.get("name") or c.get("cluster_name") or cid
+            if cid:
+                clusters[cid] = name
+        return clusters
+    except Exception as e:
+        logger.warning(f"Cluster names error: {e}")
+        return {}
+
+
 async def get_bundle_items(session, bundle_id):
     """Получить SKU и товары из bundle заявки"""
     try:
         data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle", {
-            "bundle_ids": [bundle_id]
+            "bundle_ids": [bundle_id],
+            "limit": 100,
+            "last_id": ""
         })
-        logger.info(f"Bundle {bundle_id}: {json.dumps(data)[:300]}")
+        logger.info(f"Bundle FULL RESPONSE: {json.dumps(data)}")
         return data
     except Exception as e:
         logger.warning(f"Bundle error: {e}")
@@ -163,6 +183,7 @@ async def load_clusters(user_id: int):
     """Загрузить заявки и сгруппировать по кластерам"""
     async with aiohttp.ClientSession() as session:
         orders = await get_all_active_orders(session)
+        cluster_names = await get_cluster_names(session)
 
     clusters = {}
     for order in orders:
@@ -180,7 +201,7 @@ async def load_clusters(user_id: int):
     # Сохраняем в кэш как список для индексации
     cluster_list = []
     for cid, corders in clusters.items():
-        cluster_list.append({"id": cid, "orders": corders})
+        cluster_list.append({"id": cid, "orders": corders, "names": cluster_names})
 
     cluster_cache[user_id] = cluster_list
     return cluster_list
@@ -195,8 +216,10 @@ async def get_cluster_details(user_id: int, cluster_idx: int) -> str:
     cluster = cluster_list[cluster_idx]
     cluster_id = cluster["id"]
     orders = cluster["orders"]
+    names = cluster.get("names", {})
+    cluster_display = names.get(str(cluster_id), f"Кластер {cluster_id}")
 
-    lines = [f"📍 Кластер: {cluster_id}\n"]
+    lines = [f"📍 {cluster_display}\n"]
 
     async with aiohttp.ClientSession() as session:
         for order in orders:
@@ -221,19 +244,28 @@ async def get_cluster_details(user_id: int, cluster_idx: int) -> str:
                 bundle_id = supplies[0].get("bundle_id")
                 if bundle_id:
                     bundle_data = await get_bundle_items(session, bundle_id)
+                    # Ищем items во всех возможных местах ответа
                     items = (bundle_data.get("items") or
                              bundle_data.get("products") or
-                             bundle_data.get("bundle", {}).get("items") or [])
+                             bundle_data.get("bundle_items") or
+                             bundle_data.get("result", {}).get("items") if isinstance(bundle_data.get("result"), dict) else None or
+                             [])
+                    # Если result это список
+                    if not items and isinstance(bundle_data.get("result"), list):
+                        items = bundle_data["result"]
+
                     if items:
                         for item in items:
-                            name = item.get("name") or item.get("product_name") or "—"
-                            sku  = item.get("sku") or item.get("product_id") or "—"
-                            qty  = item.get("quantity") or item.get("qty") or "—"
+                            name = (item.get("name") or item.get("product_name") or
+                                    item.get("title") or "—")
+                            sku  = (item.get("sku") or item.get("product_id") or
+                                    item.get("offer_id") or "—")
+                            qty  = (item.get("quantity") or item.get("qty") or
+                                    item.get("count") or "—")
                             lines.append(f"   🏷 {name}")
                             lines.append(f"      SKU: {sku} | Кол-во: {qty}")
                     else:
-                        logger.info(f"Bundle response keys: {list(bundle_data.keys())}")
-                        lines.append(f"   ℹ️ Товары: нет данных (bundle: {bundle_id[:8]}...)")
+                        lines.append(f"   ℹ️ Ключи ответа: {list(bundle_data.keys())}")
             lines.append("")
 
     return "\n".join(lines)
@@ -316,9 +348,11 @@ async def on_clusters(callback: CallbackQuery):
         buttons = []
         for i, cluster in enumerate(cluster_list):
             cid = cluster["id"]
+            names = cluster.get("names", {})
+            display = names.get(str(cid), f"Кластер {cid}")
             count = len(cluster["orders"])
             buttons.append([InlineKeyboardButton(
-                text=f"📍 Кластер {cid} ({count} заявок)",
+                text=f"📍 {display} ({count} заявок)",
                 callback_data=f"cluster:{i}"
             )])
         buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")])
