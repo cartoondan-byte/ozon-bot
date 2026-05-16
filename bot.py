@@ -11,7 +11,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 # ===== НАСТРОЙКИ =====
 OZON_CLIENT_ID = "1360213"
 OZON_API_KEY = "dd0e57bc-1497-4e70-a642-63266dbddcc7"
-TELEGRAM_TOKEN = "8917837150:AAHh0wOEyTCAub4_FsD3FDqG0uqdO9yZros"
+TELEGRAM_TOKEN = "8801888159:AAFJIece-JoNfGvg9PP5brVygU46_XdRbU0"
 OZON_API_URL = "https://api-seller.ozon.ru"
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
@@ -83,12 +83,9 @@ async def update_timeslot(session, supply_order_id, timeslot_id):
 # ===== ЛОГИКА =====
 
 def is_target_status(status: str) -> bool:
-    # Берём только заявки в статусе "заполнение данных" / data_filling
-    # Пропускаем готовые, архивные и старые
-    target = ["data_filling", "заполнение", "filling", "draft"]
-    s = status.lower()
     logger.info(f"Checking status: {status}")
-    return any(x in s for x in target)
+    # Из логов: нужный статус DATA_FILLING, пропускаем CANCELLED, COMPLETED, READY и т.д.
+    return status.upper() == "DATA_FILLING"
 
 def find_best_timeslot(timeslots):
     for slot in timeslots:
@@ -122,7 +119,7 @@ async def process_orders() -> str:
         if not orders:
             return "📭 Заявок на поставку не найдено."
 
-        targets = [o for o in orders if is_target_status(o.get("status", ""))]
+        targets = [o for o in orders if is_target_status(o.get("state", ""))]
 
         if not targets:
             return f"✅ Нет заявок для переноса (все в статусе «Готово»).\nВсего заявок: {len(orders)}"
