@@ -24,11 +24,14 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
+# Кэш кластеров (user_id -> {idx -> {name, orders}})
+cluster_cache: dict = {}
+
 # ===== OZON API =====
 
 async def ozon_post(session, url, payload, retry=3):
     for attempt in range(retry):
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
         async with session.post(url, json=payload, headers=HEADERS) as resp:
             text = await resp.text()
             logger.info(f"POST {url} status={resp.status}")
@@ -37,20 +40,16 @@ async def ozon_post(session, url, payload, retry=3):
                 logger.warning(f"Rate limit, ждём {wait} сек")
                 await asyncio.sleep(wait)
                 continue
-            if resp.status == 403:
-                raise Exception("Нет доступа (403).")
-            if resp.status == 401:
-                raise Exception("Неверный API-ключ (401).")
-            if resp.status == 404:
-                raise Exception(f"Метод не найден (404): {url}")
+            if resp.status in (401, 403, 404):
+                raise Exception(f"Ошибка {resp.status}: {text[:150]}")
             if resp.status != 200:
                 raise Exception(f"Ошибка {resp.status}: {text[:200]}")
             return json.loads(text)
     raise Exception("Превышен лимит запросов, попробуй позже")
 
 
-async def get_supply_orders(session):
-    """Получить заявки со статусом DATA_FILLING"""
+async def get_all_active_orders(session):
+    """Получить все активные заявки (DATA_FILLING + READY_TO_SUPPLY и др.)"""
     data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
         "limit": 50,
         "from_supply_order_id": 0,
@@ -66,77 +65,75 @@ async def get_supply_orders(session):
         "order_ids": order_ids
     })
     all_orders = details.get("orders", [])
-    result = [o for o in all_orders if o.get("state", "") == "DATA_FILLING"]
-    logger.info(f"Всего: {len(all_orders)}, DATA_FILLING: {len(result)}")
-    return result
+
+    # Активные = исключаем CANCELLED и COMPLETED
+    skip = {"CANCELLED", "COMPLETED", "REJECTED"}
+    active = [o for o in all_orders if o.get("state", "") not in skip]
+    logger.info(f"Всего: {len(all_orders)}, активных: {len(active)}")
+    return active
+
+
+async def get_data_filling_orders(session):
+    """Только DATA_FILLING для переноса"""
+    orders = await get_all_active_orders(session)
+    return [o for o in orders if o.get("state") == "DATA_FILLING"]
+
+
+async def get_bundle_items(session, bundle_id):
+    """Получить SKU и товары из bundle заявки"""
+    try:
+        data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle", {
+            "bundle_ids": [bundle_id]
+        })
+        logger.info(f"Bundle {bundle_id}: {json.dumps(data)[:300]}")
+        return data
+    except Exception as e:
+        logger.warning(f"Bundle error: {e}")
+        return {}
 
 
 async def update_timeslot(session, supply_order_id, time_from, time_to):
-    """Установить новый таймслот"""
     return await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/update", {
         "supply_order_id": supply_order_id,
-        "timeslot": {
-            "from": time_from,
-            "to": time_to
-        }
+        "timeslot": {"from": time_from, "to": time_to}
     })
 
 
-# ===== ЛОГИКА =====
+# ===== ЛОГИКА ПЕРЕНОСА =====
 
 def get_current_order_date(order):
-    """
-    Получить текущую дату отгрузки из заявки.
-    Структура: order["timeslot"]["timeslot"]["from"] = "2026-05-18T16:00:00Z" (UTC)
-    16:00 UTC = 19:00 МСК
-    """
     try:
         from_str = order["timeslot"]["timeslot"]["from"]
         dt_utc = datetime.fromisoformat(from_str.replace("Z", "+00:00"))
-        dt_msk = dt_utc.astimezone(MOSCOW_TZ)
-        logger.info(f"Текущий слот: {dt_msk.strftime('%d.%m.%Y %H:%M')} МСК")
-        return dt_msk.date()
-    except (KeyError, TypeError, ValueError) as e:
-        logger.warning(f"Не удалось получить текущую дату: {e}")
+        return dt_utc.astimezone(MOSCOW_TZ).date()
+    except (KeyError, TypeError, ValueError):
         return None
 
 
-async def process_orders() -> str:
+async def process_reschedule() -> str:
     results, errors = [], []
-
     async with aiohttp.ClientSession() as session:
-        orders = await get_supply_orders(session)
-
+        orders = await get_data_filling_orders(session)
         if not orders:
             return "📭 Нет заявок со статусом «Заполнение данных»."
 
         for order in orders:
             oid = order.get("order_id")
             onum = order.get("order_number", str(oid))
-
             try:
-                # Берём текущую дату заявки и добавляем 1 день
                 current_date = get_current_order_date(order)
-                if current_date:
-                    target_date = current_date + timedelta(days=1)
-                    logger.info(f"Заявка {onum}: {current_date} → {target_date}")
-                else:
-                    # Если не определили — берём завтра от сегодня
-                    target_date = datetime.now(MOSCOW_TZ).date() + timedelta(days=1)
-                    logger.info(f"Заявка {onum}: дата не определена, цель {target_date}")
+                target_date = (current_date + timedelta(days=1)) if current_date else \
+                              (datetime.now(MOSCOW_TZ).date() + timedelta(days=1))
 
-                # 19:00-20:00 МСК = 16:00-17:00 UTC
                 time_from = f"{target_date.strftime('%Y-%m-%d')}T16:00:00Z"
                 time_to   = f"{target_date.strftime('%Y-%m-%d')}T17:00:00Z"
 
                 result = await update_timeslot(session, oid, time_from, time_to)
-                logger.info(f"Update {onum}: {result}")
-
                 if not result.get("errors"):
-                    results.append(f"✅ {onum}: {current_date.strftime('%d.%m') if current_date else '?'} → {target_date.strftime('%d.%m.%Y')} 19:00–20:00")
+                    cd = current_date.strftime('%d.%m') if current_date else '?'
+                    results.append(f"✅ {onum}: {cd} → {target_date.strftime('%d.%m.%Y')} 19:00–20:00")
                 else:
                     errors.append(f"❌ {onum}: {result.get('errors')}")
-
             except Exception as e:
                 logger.exception(f"Ошибка для {onum}")
                 errors.append(f"❌ {onum}: {str(e)}")
@@ -146,10 +143,98 @@ async def process_orders() -> str:
         lines.append("Успешно перенесено:")
         lines.extend(results)
     if errors:
-        if results:
-            lines.append("")
+        if results: lines.append("")
         lines.append("Проблемы:")
         lines.extend(errors)
+    return "\n".join(lines)
+
+
+# ===== ЛОГИКА КЛАСТЕРОВ =====
+
+STATE_NAMES = {
+    "DATA_FILLING": "🟡 Заполнение данных",
+    "READY_TO_SUPPLY": "🟢 Готово к отгрузке",
+    "ACCEPTED": "🟢 Принято",
+    "IN_TRANSIT": "🚚 В пути",
+}
+
+
+async def load_clusters(user_id: int):
+    """Загрузить заявки и сгруппировать по кластерам"""
+    async with aiohttp.ClientSession() as session:
+        orders = await get_all_active_orders(session)
+
+    clusters = {}
+    for order in orders:
+        supplies = order.get("supplies", [])
+        cluster_id = None
+        if supplies:
+            cluster_id = supplies[0].get("macrolocal_cluster_id") or "Без кластера"
+        else:
+            cluster_id = "Без кластера"
+
+        if cluster_id not in clusters:
+            clusters[cluster_id] = []
+        clusters[cluster_id].append(order)
+
+    # Сохраняем в кэш как список для индексации
+    cluster_list = []
+    for cid, corders in clusters.items():
+        cluster_list.append({"id": cid, "orders": corders})
+
+    cluster_cache[user_id] = cluster_list
+    return cluster_list
+
+
+async def get_cluster_details(user_id: int, cluster_idx: int) -> str:
+    """Получить детали заявок по кластеру с SKU"""
+    cluster_list = cluster_cache.get(user_id)
+    if not cluster_list or cluster_idx >= len(cluster_list):
+        return "❗ Данные устарели, нажми кнопку снова."
+
+    cluster = cluster_list[cluster_idx]
+    cluster_id = cluster["id"]
+    orders = cluster["orders"]
+
+    lines = [f"📍 Кластер: {cluster_id}\n"]
+
+    async with aiohttp.ClientSession() as session:
+        for order in orders:
+            onum = order.get("order_number", "?")
+            state = order.get("state", "?")
+            state_name = STATE_NAMES.get(state, state)
+
+            # Дата отгрузки
+            try:
+                from_str = order["timeslot"]["timeslot"]["from"]
+                dt = datetime.fromisoformat(from_str.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
+                date_str = dt.strftime("%d.%m.%Y %H:%M")
+            except Exception:
+                date_str = "неизвестно"
+
+            lines.append(f"📋 Заявка {onum} | {state_name}")
+            lines.append(f"   📅 Дата отгрузки: {date_str}")
+
+            # Получаем bundle для SKU
+            supplies = order.get("supplies", [])
+            if supplies:
+                bundle_id = supplies[0].get("bundle_id")
+                if bundle_id:
+                    bundle_data = await get_bundle_items(session, bundle_id)
+                    items = (bundle_data.get("items") or
+                             bundle_data.get("products") or
+                             bundle_data.get("bundle", {}).get("items") or [])
+                    if items:
+                        for item in items:
+                            name = item.get("name") or item.get("product_name") or "—"
+                            sku  = item.get("sku") or item.get("product_id") or "—"
+                            qty  = item.get("quantity") or item.get("qty") or "—"
+                            lines.append(f"   🏷 {name}")
+                            lines.append(f"      SKU: {sku} | Кол-во: {qty}")
+                    else:
+                        logger.info(f"Bundle response keys: {list(bundle_data.keys())}")
+                        lines.append(f"   ℹ️ Товары: нет данных (bundle: {bundle_id[:8]}...)")
+            lines.append("")
 
     return "\n".join(lines)
 
@@ -161,23 +246,41 @@ dp = Dispatcher()
 
 
 def main_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📅 Перенести заявки на день вперёд", callback_data="reschedule")
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Перенести заявки на день вперёд", callback_data="reschedule")],
+        [InlineKeyboardButton(text="🔍 Поиск по кластерам и SKU", callback_data="clusters")],
+    ])
 
 
 def again_keyboard():
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🔄 Запустить снова", callback_data="reschedule")
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Запустить снова", callback_data="reschedule")],
+        [InlineKeyboardButton(text="◀️ Главное меню", callback_data="menu")],
+    ])
+
+
+def back_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ К списку кластеров", callback_data="clusters")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")],
+    ])
 
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
-        "👋 Привет! Я бот для переноса заявок на поставку Ozon FBO.\n\n"
-        "Переношу каждую заявку «Заполнение данных» на +1 день от её текущей даты (в слот 19:00–20:00).\n\n"
-        "Заявки со статусом «Готово» не трогаю.",
+        "👋 Привет! Я бот для управления заявками на поставку Ozon FBO.\n\n"
+        "Выбери действие:",
+        reply_markup=main_keyboard()
+    )
+
+
+@dp.callback_query(F.data == "menu")
+async def on_menu(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text(
+        "👋 Привет! Я бот для управления заявками на поставку Ozon FBO.\n\n"
+        "Выбери действие:",
         reply_markup=main_keyboard()
     )
 
@@ -187,11 +290,62 @@ async def on_reschedule(callback: CallbackQuery):
     await callback.answer()
     await callback.message.edit_text("⏳ Обрабатываю заявки, подождите...")
     try:
-        result = await process_orders()
+        result = await process_reschedule()
     except Exception as e:
-        logger.exception("process_orders error")
+        logger.exception("reschedule error")
         result = f"❗ Ошибка: {str(e)}"
     await callback.message.edit_text(result, reply_markup=again_keyboard())
+
+
+@dp.callback_query(F.data == "clusters")
+async def on_clusters(callback: CallbackQuery):
+    await callback.answer()
+    await callback.message.edit_text("⏳ Загружаю список кластеров...")
+    try:
+        cluster_list = await load_clusters(callback.from_user.id)
+        if not cluster_list:
+            await callback.message.edit_text(
+                "📭 Активных заявок не найдено.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")
+                ]])
+            )
+            return
+
+        # Строим клавиатуру с кластерами
+        buttons = []
+        for i, cluster in enumerate(cluster_list):
+            cid = cluster["id"]
+            count = len(cluster["orders"])
+            buttons.append([InlineKeyboardButton(
+                text=f"📍 Кластер {cid} ({count} заявок)",
+                callback_data=f"cluster:{i}"
+            )])
+        buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")])
+
+        await callback.message.edit_text(
+            f"📍 Найдено кластеров: {len(cluster_list)}\nВыбери кластер:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+        )
+    except Exception as e:
+        logger.exception("clusters error")
+        await callback.message.edit_text(f"❗ Ошибка: {str(e)}", reply_markup=main_keyboard())
+
+
+@dp.callback_query(F.data.startswith("cluster:"))
+async def on_cluster_detail(callback: CallbackQuery):
+    await callback.answer()
+    idx = int(callback.data.split(":")[1])
+    await callback.message.edit_text("⏳ Загружаю данные кластера...")
+    try:
+        text = await get_cluster_details(callback.from_user.id, idx)
+        # Telegram лимит 4096 символов
+        if len(text) > 4000:
+            text = text[:4000] + "\n...(обрезано)"
+        await callback.message.edit_text(text, reply_markup=back_keyboard())
+    except Exception as e:
+        logger.exception("cluster detail error")
+        await callback.message.edit_text(f"❗ Ошибка: {str(e)}", reply_markup=back_keyboard())
 
 
 async def main():
