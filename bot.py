@@ -9,7 +9,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 
 # ===== НАСТРОЙКИ =====
 OZON_CLIENT_ID = "1360213"
-OZON_API_KEY = "1b7a652e-c71f-4c7c-be40-5b23f71acfd4"
+OZON_API_KEY = "dd0e57bc-1497-4e70-a642-63266dbddcc7"
 TELEGRAM_TOKEN = "8801888159:AAFJIece-JoNfGvg9PP5brVygU46_XdRbU0"
 OZON_API_URL = "https://api-seller.ozon.ru"
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
