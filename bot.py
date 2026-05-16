@@ -31,7 +31,7 @@ async def ozon_post(session, url, payload, retry=3):
         await asyncio.sleep(5)
         async with session.post(url, json=payload, headers=HEADERS) as resp:
             text = await resp.text()
-            logger.info(f"POST {url} status={resp.status} body={text[:300]}")
+            logger.info(f"POST {url} status={resp.status} body={text[:2000]}")
 
             if resp.status == 429:
                 wait = 10 * (attempt + 1)
@@ -70,6 +70,8 @@ async def get_supply_orders(session):
     all_orders = details.get("orders", [])
     result = [o for o in all_orders if o.get("state", "") == "DATA_FILLING"]
     logger.info(f"Всего: {len(all_orders)}, DATA_FILLING: {len(result)}")
+    for o in result:
+        logger.info(f"DATA_FILLING order {o.get('order_number')} ВСЕ ПОЛЯ: {json.dumps(o, default=str)}")
     return result
 
 
