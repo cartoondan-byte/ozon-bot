@@ -48,8 +48,8 @@ async def get_supply_orders(session):
     data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
         "limit": 50,
         "from_supply_order_id": 0,
-        "sort_by": "SUPPLY_ORDER_SORT_BY_CREATED_AT",
-        "sort_direction": "DESC",
+        "sort_by": 1,
+        "sort_direction": 1,
         "filter": {}
     })
     # v3 возвращает orders[] или supply_orders[] — пробуем оба варианта
