@@ -163,7 +163,13 @@ async def process_orders() -> str:
                     errors.append(f"❌ {onum}: не найден слот")
                     continue
 
-                slot_id = best.get("timeslot_id") or best.get("id")
+                logger.info(f"Best slot keys: {list(best.keys())} values: {best}")
+                slot_id = (best.get("timeslot_id") or best.get("id") or 
+                          best.get("slot_id") or best.get("timeslot") or
+                          best.get("time_slot_id"))
+                if not slot_id:
+                    errors.append(f"❌ {onum}: не найден ID слота. Ключи: {list(best.keys())}")
+                    continue
                 result = await update_timeslot(session, oid, slot_id)
 
                 if result.get("operation_id") or not result.get("error"):
