@@ -88,10 +88,11 @@ async def get_timeslots(session, supply_order_id, date_from, date_to):
     logger.info(f"timeslot response: {str(data)[:300]}")
     return data.get("timeslots", [])
 
-async def update_timeslot(session, supply_order_id, timeslot_id):
+async def update_timeslot(session, supply_order_id, time_from, time_to):
     return await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/update", {
         "supply_order_id": supply_order_id,
-        "timeslot_id": timeslot_id
+        "from": time_from,
+        "to": time_to
     })
 
 # ===== ЛОГИКА =====
