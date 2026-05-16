@@ -290,9 +290,9 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
     unique_orders = list(seen_bundles.values())
     logger.info(f"Всего заявок: {len(all_orders)}, уникальных bundle: {len(unique_orders)}")
 
-    async def fetch_one(session, order):
-        """Получить bundle одной заявки (с семафором)"""
-        async with _semaphore:
+    async with aiohttp.ClientSession() as session:
+        # Последовательно — rate limit не позволяет параллельные bundle запросы
+        for order in unique_orders:
             onum = order.get("order_number", "?")
             raw_state = order.get("state", "")
             state_name = STATE_NAMES.get(raw_state, raw_state)
@@ -305,24 +305,15 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
             supplies = order.get("supplies", [])
             bundle_id = supplies[0].get("bundle_id") if supplies else None
             if not bundle_id:
-                return onum, ship_dt, state_name, raw_state, []
+                continue
 
-            bundle_data = await get_bundle_items_fast(session, bundle_id)
-            items = bundle_data.get("items") or []
-            logger.info(f"Bundle {onum}: {len(items)} items")
-            return onum, ship_dt, state_name, raw_state, items
-
-    async with aiohttp.ClientSession() as session:
-        results = await asyncio.gather(
-            *[fetch_one(session, o) for o in unique_orders],
-            return_exceptions=True
-        )
-
-    for res in results:
-        if isinstance(res, Exception):
-            logger.warning(f"Bundle fetch error: {res}")
-            continue
-        onum, ship_dt, state_name, raw_state, items = res
+            try:
+                bundle_data = await get_bundle_items_fast(session, bundle_id)
+                items = bundle_data.get("items") or []
+                logger.info(f"Bundle {onum}: {len(items)} items, state={raw_state}")
+            except Exception as e:
+                logger.warning(f"Bundle error {onum}: {e}")
+                continue
         for item in items:
             sku = str(item.get("sku") or item.get("product_id") or "")
             if not sku:
