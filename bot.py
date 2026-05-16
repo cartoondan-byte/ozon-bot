@@ -179,7 +179,7 @@ async def process_reschedule() -> str:
 
                 if not result.get("errors"):
                     cd = current_date.strftime('%d.%m') if current_date else '?'
-                    results.append(f"✅ {onum}: {cd} → {target_date.strftime('%d.%m')} (+{random_days}д)")
+                    results.append(f"✅ {onum}: {cd} → {target_date.strftime('%d.%m')} (+{random_days}д от сегодня)")
                 else:
                     errors.append(f"❌ {onum}: {result.get('errors')}")
             except Exception as e:
