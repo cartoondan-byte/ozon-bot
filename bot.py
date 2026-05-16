@@ -80,29 +80,21 @@ async def get_data_filling_orders(session):
 
 
 async def get_cluster_names(session):
-    """Получить названия кластеров. Строим маппинг всех уровней вложенности."""
-    result = {}
-
-    def extract_ids(obj, parent_name=""):
-        """Рекурсивно извлекаем все id → name из структуры"""
-        if isinstance(obj, dict):
-            cid  = str(obj.get("id") or obj.get("cluster_id") or "")
-            name = obj.get("name") or obj.get("cluster_name") or parent_name
-            if cid and name:
-                result[cid] = name
-                parent_name = name
-            for v in obj.values():
-                extract_ids(v, parent_name)
-        elif isinstance(obj, list):
-            for item in obj:
-                extract_ids(item, parent_name)
-
+    """
+    Получить маппинг macrolocal_cluster_id → название кластера.
+    Структура ответа: clusters[].macrolocal_cluster_id + clusters[].name
+    Пример: {4039: "Москва, МО и Дальние регионы", 4071: "Ростов", ...}
+    """
     try:
         data = await ozon_post(session, f"{OZON_API_URL}/v1/cluster/list", {
             "cluster_type": "CLUSTER_TYPE_OZON"
         })
-        logger.info(f"Cluster full response: {json.dumps(data)}")
-        extract_ids(data)
+        result = {}
+        for cluster in data.get("clusters", []):
+            macro_id = str(cluster.get("macrolocal_cluster_id", ""))
+            name = cluster.get("name", "")
+            if macro_id and name:
+                result[macro_id] = name
         logger.info(f"Cluster names map: {result}")
         return result
     except Exception as e:
