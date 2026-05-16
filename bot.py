@@ -28,13 +28,13 @@ HEADERS = {
 
 async def ozon_post(session, url, payload, retry=3):
     for attempt in range(retry):
-        await asyncio.sleep(3)
+        await asyncio.sleep(5)
         async with session.post(url, json=payload, headers=HEADERS) as resp:
             text = await resp.text()
             logger.info(f"POST {url} status={resp.status} body={text[:300]}")
 
             if resp.status == 429:
-                wait = 5 * (attempt + 1)
+                wait = 10 * (attempt + 1)
                 logger.warning(f"Rate limit, ждём {wait} сек")
                 await asyncio.sleep(wait)
                 continue
