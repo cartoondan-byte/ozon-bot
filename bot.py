@@ -10,8 +10,8 @@ from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # ===== НАСТРОЙКИ =====
-OZON_CLIENT_ID = "1360213"
-OZON_API_KEY = "dd0e57bc-1497-4e70-a642-63266dbddcc7"
+OZON_CLIENT_ID = "1408626"
+OZON_API_KEY = "b96a8e5a-092b-44d8-ac4f-a6dc36d1a4fc"
 TELEGRAM_TOKEN = "8917837150:AAHh0wOEyTCAub4_FsD3FDqG0uqdO9yZros"
 OZON_API_URL = "https://api-seller.ozon.ru"
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
