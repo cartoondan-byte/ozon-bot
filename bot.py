@@ -311,7 +311,7 @@ async def cmd_start(message: types.Message):
 async def on_menu(callback: CallbackQuery):
     await callback.answer()
     await callback.message.edit_text(
-        "👋 Привет! Я бот для управления заявками на поставку Ozon FBO.\n\n"
+        "👋 Привет! Я бот для управленИИ заявками на поставку Ozon FBO.\n\n"
         "Выбери действие:",
         reply_markup=main_keyboard()
     )
