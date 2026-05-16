@@ -50,7 +50,13 @@ async def get_supply_orders(session):
         "from_supply_order_id": 0,
         "sort_by": 1,
         "sort_direction": 1,
-        "filter": {}
+        "filter": {
+            "states": [
+                "SUPPLY_ORDER_STATE_DRAFT",
+                "SUPPLY_ORDER_STATE_DATA_FILLING",
+                "SUPPLY_ORDER_STATE_READY_TO_SUPPLY"
+            ]
+        }
     })
     # v3 возвращает orders[] или supply_orders[] — пробуем оба варианта
     return data.get("orders", data.get("supply_orders", []))
