@@ -137,39 +137,63 @@ def get_current_order_date(order):
 
 async def process_reschedule() -> str:
     results, errors = [], []
+    today = datetime.now(MOSCOW_TZ).date()
+    deadline = today + timedelta(days=3)  # отбираем заявки с датой до сегодня+3
+
     async with aiohttp.ClientSession() as session:
         orders = await get_data_filling_orders(session)
         if not orders:
             return "📭 Нет заявок со статусом «Заполнение данных»."
 
-        for order in orders:
+        # Фильтруем: только заявки с датой отгрузки от сегодня до +3 дней
+        near_orders = [
+            o for o in orders
+            if (d := get_current_order_date(o)) is not None and today <= d <= deadline
+        ]
+        logger.info(f"DATA_FILLING: {len(orders)}, ближайших (до {deadline}): {len(near_orders)}")
+
+        if not near_orders:
+            return (
+                f"📭 Нет заявок для переноса.\n"
+                f"Всего DATA_FILLING: {len(orders)}\n"
+                f"Ближайших (от сегодня до {deadline.strftime('%d.%m')}): 0\n\n"
+                f"Все заявки уже достаточно далеко по датам."
+            )
+
+        for order in near_orders:
             oid = order.get("order_id")
             onum = order.get("order_number", str(oid))
             try:
                 current_date = get_current_order_date(order)
-                target_date = (current_date + timedelta(days=10)) if current_date else \
-                              (datetime.now(MOSCOW_TZ).date() + timedelta(days=10))
+
+                # Случайное смещение +10..+28 дней от СЕГОДНЯ
+                random_days = random.randint(10, 28)
+                target_date = today + timedelta(days=random_days)
 
                 time_from = f"{target_date.strftime('%Y-%m-%d')}T16:00:00Z"
                 time_to   = f"{target_date.strftime('%Y-%m-%d')}T17:00:00Z"
 
                 result = await update_timeslot(session, oid, time_from, time_to)
+                logger.info(f"Update {onum}: {result}")
+
                 if not result.get("errors"):
                     cd = current_date.strftime('%d.%m') if current_date else '?'
-                    results.append(f"✅ {onum}: {cd} → {target_date.strftime('%d.%m.%Y')} 19:00–20:00")
+                    results.append(f"✅ {onum}: {cd} → {target_date.strftime('%d.%m')} (+{random_days}д)")
                 else:
                     errors.append(f"❌ {onum}: {result.get('errors')}")
             except Exception as e:
                 logger.exception(f"Ошибка для {onum}")
                 errors.append(f"❌ {onum}: {str(e)}")
 
-    lines = [f"📦 Заявок для переноса: {len(orders)}\n"]
+    lines = [
+        f"📦 Всего DATA_FILLING: {len(orders)}",
+        f"📅 Ближайших (до {deadline.strftime('%d.%m')}): {len(near_orders)}",
+        f"🔀 Перенесены на +10..+28 дней случайно:\n",
+    ]
     if results:
-        lines.append("Успешно перенесено:")
         lines.extend(results)
     if errors:
-        if results: lines.append("")
-        lines.append("Проблемы:")
+        lines.append("\nПроблемы:")
         lines.extend(errors)
     return "\n".join(lines)
 
