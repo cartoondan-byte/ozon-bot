@@ -27,14 +27,15 @@ HEADERS = {
 # ===== OZON API =====
 
 async def ozon_post(session, url, payload):
-    """Универсальный метод для запросов к Ozon API с нормальной обработкой ошибок"""
     async with session.post(url, json=payload, headers=HEADERS) as resp:
         text = await resp.text()
         logger.info(f"POST {url} status={resp.status} body={text[:500]}")
         if resp.status == 403:
-            raise Exception(f"Нет доступа (403). Проверь права API-ключа в Ozon Seller.")
+            raise Exception("Нет доступа (403). Проверь права API-ключа в Ozon Seller → Настройки → API ключи.")
         if resp.status == 401:
-            raise Exception(f"Неверный API-ключ (401). Проверь Client-Id и Api-Key.")
+            raise Exception("Неверный API-ключ (401). Проверь Client-Id и Api-Key.")
+        if resp.status == 404:
+            raise Exception(f"Метод не найден (404): {url}")
         if resp.status != 200:
             raise Exception(f"Ozon API вернул ошибку {resp.status}: {text[:300]}")
         try:
@@ -43,27 +44,35 @@ async def ozon_post(session, url, payload):
             raise Exception(f"Ozon API вернул не JSON: {text[:300]}")
 
 async def get_supply_orders(session):
-    data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/list",
-                           {"paging": {"from_supply_order_id": 0, "limit": 50}, "filter": {}})
-    return data.get("supply_orders", [])
+    # v3 — актуальная версия (v1 и v2 удалены в декабре 2025)
+    data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
+        "paging": {"from_supply_order_id": 0, "limit": 50},
+        "filter": {}
+    })
+    # v3 возвращает orders[] или supply_orders[] — пробуем оба варианта
+    return data.get("orders", data.get("supply_orders", []))
 
 async def get_timeslots(session, supply_order_id, date_from, date_to):
-    data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/list",
-                           {"supply_order_id": supply_order_id, "date_from": date_from, "date_to": date_to})
+    data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/list", {
+        "supply_order_id": supply_order_id,
+        "date_from": date_from,
+        "date_to": date_to
+    })
     return data.get("timeslots", [])
 
 async def update_timeslot(session, supply_order_id, timeslot_id):
-    return await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/update",
-                           {"supply_order_id": supply_order_id, "timeslot_id": timeslot_id})
+    return await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/update", {
+        "supply_order_id": supply_order_id,
+        "timeslot_id": timeslot_id
+    })
 
 # ===== ЛОГИКА =====
 
 def is_target_status(status: str) -> bool:
     skip = ["ready", "completed", "готово", "ready_to_supply"]
-    s = status.lower()
-    return not any(x in s for x in skip)
+    return not any(x in status.lower() for x in skip)
 
-def find_best_timeslot(timeslots: list):
+def find_best_timeslot(timeslots):
     for slot in timeslots:
         try:
             dt = datetime.fromisoformat(slot["from"].replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
