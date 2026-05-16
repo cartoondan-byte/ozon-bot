@@ -80,20 +80,28 @@ async def get_data_filling_orders(session):
 
 
 async def get_cluster_names(session):
-    """Получить названия кластеров через /v1/cluster/list"""
+    """Получить названия кластеров через /v1/cluster/list.
+    Структура: clusters[].logistic_clusters[] — строим маппинг обоих уровней.
+    """
     try:
         data = await ozon_post(session, f"{OZON_API_URL}/v1/cluster/list", {
             "cluster_type": "CLUSTER_TYPE_OZON"
         })
-        logger.info(f"Cluster list response: {json.dumps(data)[:500]}")
-        clusters = {}
-        for c in (data.get("clusters") or data.get("result") or []):
-            cid = str(c.get("id") or c.get("cluster_id") or "")
-            name = c.get("name") or c.get("cluster_name") or c.get("title") or cid
-            if cid:
-                clusters[cid] = name
-        logger.info(f"Cluster names map: {clusters}")
-        return clusters
+        result = {}
+        for macro in (data.get("clusters") or []):
+            macro_id   = str(macro.get("id") or "")
+            macro_name = macro.get("name") or macro_id
+            # Маппинг макро-кластера
+            if macro_id:
+                result[macro_id] = macro_name
+            # Маппинг вложенных логистических кластеров → имя макро
+            for lc in (macro.get("logistic_clusters") or []):
+                lc_id = str(lc.get("id") or "")
+                lc_name = lc.get("name") or macro_name  # если нет своего имени — берём имя макро
+                if lc_id:
+                    result[lc_id] = lc_name
+        logger.info(f"Cluster names map: {result}")
+        return result
     except Exception as e:
         logger.warning(f"Cluster names error: {e}")
         return {}
