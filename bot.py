@@ -28,11 +28,14 @@ HEADERS = {
 # Кэш кластеров (user_id -> {idx -> {name, orders}})
 cluster_cache: dict = {}
 
+# Семафор для параллельных запросов (не более 5 одновременно)
+_semaphore = asyncio.Semaphore(5)
+
 # ===== OZON API =====
 
-async def ozon_post(session, url, payload, retry=3):
+async def ozon_post(session, url, payload, retry=3, delay=0.5):
     for attempt in range(retry):
-        await asyncio.sleep(2)
+        await asyncio.sleep(delay)
         async with session.post(url, json=payload, headers=HEADERS) as resp:
             text = await resp.text()
             logger.info(f"POST {url} status={resp.status}")
@@ -125,18 +128,32 @@ async def get_bundle_items(session, bundle_id):
             "limit": 100,
             "last_id": ""
         })
-        logger.info(f"Bundle FULL RESPONSE: {json.dumps(data)}")
         return data
     except Exception as e:
         logger.warning(f"Bundle error: {e}")
         return {}
 
 
+async def get_bundle_items_fast(session, bundle_id):
+    """Быстрый вариант без лишнего логирования (для параллельной загрузки)"""
+    try:
+        data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle", {
+            "bundle_ids": [bundle_id],
+            "limit": 100,
+            "last_id": ""
+        }, delay=0.3)
+        return data
+    except Exception as e:
+        logger.warning(f"Bundle error {bundle_id[:8]}: {e}")
+        return {}
+
+
 async def update_timeslot(session, supply_order_id, time_from, time_to):
+    # delay=2 — пауза для write-операций, чтобы не превысить rate limit
     return await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/update", {
         "supply_order_id": supply_order_id,
         "timeslot": {"from": time_from, "to": time_to}
-    })
+    }, delay=2)
 
 
 # ===== ЛОГИКА ПЕРЕНОСА =====
@@ -262,8 +279,9 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
     orders = cluster["orders"]
     sku_map = {}  # sku_id -> {name, offer_id, orders: [...]}
 
-    async with aiohttp.ClientSession() as session:
-        for order in orders:
+    async def fetch_bundle_for_order(session, order):
+        """Получить bundle для одной заявки"""
+        async with _semaphore:
             onum = order.get("order_number", "?")
             try:
                 from_str = order["timeslot"]["timeslot"]["from"]
@@ -271,35 +289,37 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
                 date_str = dt.strftime("%d.%m.%Y %H:%M")
             except Exception:
                 date_str = "?"
-
-            state = order.get("state", "?")
-            state_name = STATE_NAMES.get(state, state)
-
+            state = STATE_NAMES.get(order.get("state", "?"), order.get("state", "?"))
             supplies = order.get("supplies", [])
             if not supplies:
-                continue
+                return onum, date_str, state, []
             bundle_id = supplies[0].get("bundle_id")
             if not bundle_id:
+                return onum, date_str, state, []
+            bundle_data = await get_bundle_items_fast(session, bundle_id)
+            return onum, date_str, state, bundle_data.get("items") or []
+
+    async with aiohttp.ClientSession() as session:
+        # Параллельно загружаем все bundle
+        bundle_results = await asyncio.gather(*[
+            fetch_bundle_for_order(session, order) for order in orders
+        ])
+
+    for onum, date_str, state_name, items in bundle_results:
+        for item in items:
+            sku = str(item.get("sku") or item.get("product_id") or "")
+            if not sku:
                 continue
-
-            bundle_data = await get_bundle_items(session, bundle_id)
-            items = bundle_data.get("items") or []
-
-            for item in items:
-                sku = str(item.get("sku") or item.get("product_id") or "")
-                if not sku:
-                    continue
-                name = item.get("name") or "—"
-                qty = item.get("quantity") or 0
-
-                if sku not in sku_map:
-                    sku_map[sku] = {"name": name, "orders": []}
-                sku_map[sku]["orders"].append({
-                    "order_number": onum,
-                    "date": date_str,
-                    "qty": qty,
-                    "state": state_name,
-                })
+            name = item.get("name") or "—"
+            qty = item.get("quantity") or 0
+            if sku not in sku_map:
+                sku_map[sku] = {"name": name, "orders": []}
+            sku_map[sku]["orders"].append({
+                "order_number": onum,
+                "date": date_str,
+                "qty": qty,
+                "state": state_name,
+            })
 
     # Сохраняем в кэш
     if user_id not in cluster_cache:
