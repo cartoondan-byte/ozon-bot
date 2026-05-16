@@ -30,6 +30,10 @@ async def ozon_post(session, url, payload):
     async with session.post(url, json=payload, headers=HEADERS) as resp:
         text = await resp.text()
         logger.info(f"POST {url} status={resp.status} body={text[:500]}")
+        if resp.status == 429:
+            logger.warning("Rate limit, ждём 2 сек...")
+            await asyncio.sleep(2)
+            raise Exception(f"Превышен лимит запросов, попробуй ещё раз через несколько секунд")
         if resp.status == 403:
             raise Exception("Нет доступа (403). Проверь права API-ключа в Ozon Seller → Настройки → API ключи.")
         if resp.status == 401:
