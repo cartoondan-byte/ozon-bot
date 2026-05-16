@@ -270,42 +270,48 @@ async def load_clusters(user_id: int):
 
 
 async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
-    """Загрузить SKU для кластера. Возвращает {sku_id: {name, orders: [{order, qty, date}]}}"""
+    """Загрузить SKU для кластера. {sku: {name, total_qty, orders: [{...}]}}"""
     cluster_list = cluster_cache.get(user_id)
     if not cluster_list or cluster_idx >= len(cluster_list):
         return {}
 
     cluster = cluster_list[cluster_idx]
     orders = cluster["orders"]
-    sku_map = {}  # sku_id -> {name, offer_id, orders: [...]}
+    sku_map = {}
 
-    async def fetch_bundle_for_order(session, order):
-        """Получить bundle для одной заявки"""
+    async def fetch_one(session, order):
+        """Получить bundle одной заявки (с семафором)"""
         async with _semaphore:
             onum = order.get("order_number", "?")
+            state_name = STATE_NAMES.get(order.get("state", ""), order.get("state", ""))
+            # Дата как объект для сортировки
             try:
                 from_str = order["timeslot"]["timeslot"]["from"]
-                dt = datetime.fromisoformat(from_str.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
-                date_str = dt.strftime("%d.%m.%Y %H:%M")
+                ship_dt = datetime.fromisoformat(from_str.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
             except Exception:
-                date_str = "?"
-            state = STATE_NAMES.get(order.get("state", "?"), order.get("state", "?"))
+                ship_dt = datetime.max.replace(tzinfo=MOSCOW_TZ)
+
             supplies = order.get("supplies", [])
-            if not supplies:
-                return onum, date_str, state, []
-            bundle_id = supplies[0].get("bundle_id")
+            bundle_id = supplies[0].get("bundle_id") if supplies else None
             if not bundle_id:
-                return onum, date_str, state, []
+                return onum, ship_dt, state_name, []
+
             bundle_data = await get_bundle_items_fast(session, bundle_id)
-            return onum, date_str, state, bundle_data.get("items") or []
+            items = bundle_data.get("items") or []
+            logger.info(f"Bundle {onum}: {len(items)} items, keys={list(bundle_data.keys())}")
+            return onum, ship_dt, state_name, items
 
     async with aiohttp.ClientSession() as session:
-        # Параллельно загружаем все bundle
-        bundle_results = await asyncio.gather(*[
-            fetch_bundle_for_order(session, order) for order in orders
-        ])
+        results = await asyncio.gather(
+            *[fetch_one(session, o) for o in orders],
+            return_exceptions=True
+        )
 
-    for onum, date_str, state_name, items in bundle_results:
+    for res in results:
+        if isinstance(res, Exception):
+            logger.warning(f"Bundle fetch error: {res}")
+            continue
+        onum, ship_dt, state_name, items = res
         for item in items:
             sku = str(item.get("sku") or item.get("product_id") or "")
             if not sku:
@@ -316,35 +322,40 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
                 sku_map[sku] = {"name": name, "orders": []}
             sku_map[sku]["orders"].append({
                 "order_number": onum,
-                "date": date_str,
+                "ship_dt": ship_dt,        # datetime для сортировки
+                "date_str": ship_dt.strftime("%d.%m.%Y %H:%M"),
                 "qty": qty,
                 "state": state_name,
             })
 
-    # Сохраняем в кэш
-    if user_id not in cluster_cache:
-        cluster_cache[user_id] = []
+    # Сортируем заявки по дате и оставляем 5 ближайших
+    for sku in sku_map:
+        sku_map[sku]["orders"].sort(key=lambda x: x["ship_dt"])
+        sku_map[sku]["orders"] = sku_map[sku]["orders"][:5]
+        sku_map[sku]["total_qty"] = sum(o["qty"] for o in sku_map[sku]["orders"])
+
+    logger.info(f"SKU map: {list(sku_map.keys())}")
     cluster_list[cluster_idx]["sku_map"] = sku_map
     return sku_map
 
 
 def format_sku_detail(cluster_name: str, sku: str, sku_map: dict) -> str:
-    """Форматируем детали по конкретному SKU"""
+    """Форматируем детали по конкретному SKU (5 ближайших заявок)"""
     info = sku_map.get(sku, {})
     product_name = info.get("name", "—")
     orders = info.get("orders", [])
+    total_qty = info.get("total_qty", 0)
 
-    total_qty = sum(o["qty"] for o in orders)
     lines = [
         f"📍 {cluster_name}",
         f"🏷 {product_name}",
         f"SKU: {sku}",
-        f"Всего единиц в заявках: {total_qty}",
+        f"Ближайших 5 заявок | {total_qty} шт. суммарно",
         "",
     ]
     for o in orders:
         lines.append(f"📋 {o['order_number']} | {o['state']}")
-        lines.append(f"   📅 {o['date']} | {o['qty']} шт.")
+        lines.append(f"   📅 {o['date_str']} | {o['qty']} шт.")
         lines.append("")
 
     return "\n".join(lines)
