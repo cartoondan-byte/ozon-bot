@@ -11,7 +11,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 # ===== НАСТРОЙКИ =====
 OZON_CLIENT_ID = "1360213"
 OZON_API_KEY = "dd0e57bc-1497-4e70-a642-63266dbddcc7"
-TELEGRAM_TOKEN = "8917837150:AAHh0wOEyTCAub4_FsD3FDqG0uqdO9yZros"
+TELEGRAM_TOKEN = "8801888159:AAFJIece-JoNfGvg9PP5brVygU46_XdRbU0"
 OZON_API_URL = "https://api-seller.ozon.ru"
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
@@ -65,9 +65,18 @@ async def get_supply_orders(session):
     logger.info(f"supply-order/get response: {str(detail)[:500]}")
     return detail.get("orders", [])
 
+async def get_available_timeslots_via_draft(session, supply_order_id, date_from, date_to):
+    """Пробуем получить таймслоты через draft endpoint"""
+    data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/get", {
+        "supply_order_id": supply_order_id,
+        "date_from": date_from,
+        "date_to": date_to
+    })
+    logger.info(f"timeslot/get response: {str(data)[:300]}")
+    return data
+
 async def get_timeslots(session, supply_order_id, date_from, date_to):
-    # Пробуем v3
-    data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/timeslot/list", {
+    data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/get", {
         "supply_order_id": supply_order_id,
         "date_from": date_from,
         "date_to": date_to
@@ -76,7 +85,7 @@ async def get_timeslots(session, supply_order_id, date_from, date_to):
     return data.get("timeslots", [])
 
 async def update_timeslot(session, supply_order_id, timeslot_id):
-    return await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/timeslot/update", {
+    return await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/update", {
         "supply_order_id": supply_order_id,
         "timeslot_id": timeslot_id
     })
