@@ -49,28 +49,42 @@ async def ozon_post(session, url, payload, retry=3):
     raise Exception("Превышен лимит запросов, попробуй позже")
 
 
-async def get_all_active_orders(session):
-    """Получить все активные заявки (DATA_FILLING + READY_TO_SUPPLY и др.)"""
-    data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
-        "limit": 50,
-        "from_supply_order_id": 0,
-        "sort_by": 1,
-        "sort_direction": 1,
-        "filter": {"states": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}
-    })
-    order_ids = data.get("order_ids", [])
-    if not order_ids:
+async def get_all_active_orders(session, max_orders=2000):
+    """Получить все активные заявки с пагинацией (до max_orders штук)"""
+    all_ids = []
+    last_id = 0
+
+    while len(all_ids) < max_orders:
+        data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
+            "limit": 100,
+            "from_supply_order_id": last_id,
+            "sort_by": 1,
+            "sort_direction": 1,
+            "filter": {"states": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}
+        })
+        page_ids = data.get("order_ids", [])
+        if not page_ids:
+            break
+        all_ids.extend(page_ids)
+        if len(page_ids) < 100:
+            break  # последняя страница
+        last_id = page_ids[-1]
+
+    if not all_ids:
         return []
 
-    details = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
-        "order_ids": order_ids
-    })
-    all_orders = details.get("orders", [])
+    # Получаем детали батчами по 100
+    all_orders = []
+    for i in range(0, len(all_ids), 100):
+        batch = all_ids[i:i+100]
+        details = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
+            "order_ids": batch
+        })
+        all_orders.extend(details.get("orders", []))
 
-    # Активные = исключаем CANCELLED и COMPLETED
     skip = {"CANCELLED", "COMPLETED", "REJECTED"}
     active = [o for o in all_orders if o.get("state", "") not in skip]
-    logger.info(f"Всего: {len(all_orders)}, активных: {len(active)}")
+    logger.info(f"Всего ID: {len(all_ids)}, получено: {len(all_orders)}, активных: {len(active)}")
     return active
 
 
