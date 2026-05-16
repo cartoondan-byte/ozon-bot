@@ -51,7 +51,7 @@ async def get_supply_orders(session):
         "sort_by": 1,
         "sort_direction": 1,
         "filter": {
-            "states": [1, 2, 3, 4, 5]
+            "states": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         }
     })
     # v3 возвращает orders[] или supply_orders[] — пробуем оба варианта
