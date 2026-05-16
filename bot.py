@@ -44,7 +44,7 @@ async def ozon_post(session, url, payload):
             raise Exception(f"Ozon API вернул не JSON: {text[:300]}")
 
 async def get_supply_orders(session):
-    # v3 — актуальная версия (v1 и v2 удалены в декабре 2025)
+    # Шаг 1: получаем список ID заявок
     data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
         "limit": 50,
         "from_supply_order_id": 0,
@@ -54,8 +54,23 @@ async def get_supply_orders(session):
             "states": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         }
     })
-    # v3 возвращает orders[] или supply_orders[] — пробуем оба варианта
-    return data.get("orders", data.get("supply_orders", []))
+    order_ids = data.get("order_ids", [])
+    if not order_ids:
+        return []
+
+    # Шаг 2: получаем детали каждой заявки через /v3/supply-order/get
+    orders = []
+    for oid in order_ids:
+        try:
+            detail = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
+                "order_id": oid
+            })
+            order = detail.get("order", detail)
+            if order:
+                orders.append(order)
+        except Exception as e:
+            logger.warning(f"Не удалось получить заявку {oid}: {e}")
+    return orders
 
 async def get_timeslots(session, supply_order_id, date_from, date_to):
     data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/list", {
