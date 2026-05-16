@@ -276,8 +276,19 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
         return {}
 
     cluster = cluster_list[cluster_idx]
-    orders = cluster["orders"]
+    all_orders = cluster["orders"]  # все активные
     sku_map = {}
+
+    # Дедупликация по bundle_id (для получения списка уникальных SKU)
+    seen_bundles = {}
+    for order in all_orders:
+        supplies = order.get("supplies", [])
+        if supplies:
+            bid = supplies[0].get("bundle_id")
+            if bid and bid not in seen_bundles:
+                seen_bundles[bid] = order
+    unique_orders = list(seen_bundles.values())
+    logger.info(f"Всего заявок: {len(all_orders)}, уникальных bundle: {len(unique_orders)}")
 
     async def fetch_one(session, order):
         """Получить bundle одной заявки (с семафором)"""
@@ -303,7 +314,7 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
 
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(
-            *[fetch_one(session, o) for o in orders],
+            *[fetch_one(session, o) for o in unique_orders],
             return_exceptions=True
         )
 
@@ -311,7 +322,7 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
         if isinstance(res, Exception):
             logger.warning(f"Bundle fetch error: {res}")
             continue
-        onum, ship_dt, state_name, items = res
+        onum, ship_dt, state_name, raw_state, items = res
         for item in items:
             sku = str(item.get("sku") or item.get("product_id") or "")
             if not sku:
@@ -328,11 +339,14 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
                 "state": state_name,
             })
 
-    # Сортируем заявки по дате и оставляем 5 ближайших
+    # Для каждого SKU: все заявки → фильтр DATA_FILLING → сортировка → 5 ближайших
     for sku in sku_map:
-        sku_map[sku]["orders"].sort(key=lambda x: x["ship_dt"])
-        sku_map[sku]["orders"] = sku_map[sku]["orders"][:5]
+        all_sku_orders = sku_map[sku]["orders"]
+        df_orders = [o for o in all_sku_orders if o.get("raw_state") == "DATA_FILLING"]
+        df_orders.sort(key=lambda x: x["ship_dt"])
+        sku_map[sku]["orders"] = df_orders[:5]
         sku_map[sku]["total_qty"] = sum(o["qty"] for o in sku_map[sku]["orders"])
+        sku_map[sku]["all_count"] = len(all_sku_orders)  # всего заявок по SKU
 
     logger.info(f"SKU map: {list(sku_map.keys())}")
     cluster_list[cluster_idx]["sku_map"] = sku_map
@@ -346,11 +360,12 @@ def format_sku_detail(cluster_name: str, sku: str, sku_map: dict) -> str:
     orders = info.get("orders", [])
     total_qty = info.get("total_qty", 0)
 
+    all_count = info.get("all_count", len(orders))
     lines = [
         f"📍 {cluster_name}",
         f"🏷 {product_name}",
         f"SKU: {sku}",
-        f"Ближайших 5 заявок | {total_qty} шт. суммарно",
+        f"Всего заявок: {all_count} | Показаны 5 ближайших DATA_FILLING: {total_qty} шт.",
         "",
     ]
     for o in orders:
