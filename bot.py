@@ -80,17 +80,19 @@ async def get_data_filling_orders(session):
 
 
 async def get_cluster_names(session):
-    """Получить названия кластеров"""
+    """Получить названия кластеров через /v1/cluster/list"""
     try:
-        data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/cluster/list", {})
-        logger.info(f"Cluster list: {json.dumps(data)[:500]}")
-        # Строим словарь id -> name
+        data = await ozon_post(session, f"{OZON_API_URL}/v1/cluster/list", {
+            "cluster_type": "CLUSTER_TYPE_OZON"
+        })
+        logger.info(f"Cluster list response: {json.dumps(data)[:500]}")
         clusters = {}
-        for c in data.get("clusters", data.get("result", [])):
+        for c in (data.get("clusters") or data.get("result") or []):
             cid = str(c.get("id") or c.get("cluster_id") or "")
-            name = c.get("name") or c.get("cluster_name") or cid
+            name = c.get("name") or c.get("cluster_name") or c.get("title") or cid
             if cid:
                 clusters[cid] = name
+        logger.info(f"Cluster names map: {clusters}")
         return clusters
     except Exception as e:
         logger.warning(f"Cluster names error: {e}")
@@ -187,21 +189,18 @@ async def load_clusters(user_id: int):
 
     clusters = {}
     for order in orders:
-        supplies = order.get("supplies", [])
-        cluster_id = None
-        if supplies:
-            cluster_id = supplies[0].get("macrolocal_cluster_id") or "Без кластера"
-        else:
-            cluster_id = "Без кластера"
+        # Используем drop_off_warehouse.name как название кластера
+        warehouse = order.get("drop_off_warehouse", {})
+        cluster_name = warehouse.get("name", "Без кластера")
 
-        if cluster_id not in clusters:
-            clusters[cluster_id] = []
-        clusters[cluster_id].append(order)
+        if cluster_name not in clusters:
+            clusters[cluster_name] = []
+        clusters[cluster_name].append(order)
 
     # Сохраняем в кэш как список для индексации
     cluster_list = []
-    for cid, corders in clusters.items():
-        cluster_list.append({"id": cid, "orders": corders, "names": cluster_names})
+    for cname, corders in clusters.items():
+        cluster_list.append({"id": cname, "orders": corders, "names": {}})
 
     cluster_cache[user_id] = cluster_list
     return cluster_list
@@ -244,28 +243,23 @@ async def get_cluster_details(user_id: int, cluster_idx: int) -> str:
                 bundle_id = supplies[0].get("bundle_id")
                 if bundle_id:
                     bundle_data = await get_bundle_items(session, bundle_id)
-                    # Ищем items во всех возможных местах ответа
-                    items = (bundle_data.get("items") or
-                             bundle_data.get("products") or
-                             bundle_data.get("bundle_items") or
-                             bundle_data.get("result", {}).get("items") if isinstance(bundle_data.get("result"), dict) else None or
-                             [])
-                    # Если result это список
+                    logger.info(f"Bundle keys: {list(bundle_data.keys())}, full: {json.dumps(bundle_data)[:500]}")
+                    # Ищем items во всех возможных ключах
+                    items = bundle_data.get("items") or bundle_data.get("products") or bundle_data.get("bundle_items") or []
                     if not items and isinstance(bundle_data.get("result"), list):
                         items = bundle_data["result"]
+                    elif not items and isinstance(bundle_data.get("result"), dict):
+                        items = bundle_data["result"].get("items", [])
 
                     if items:
                         for item in items:
-                            name = (item.get("name") or item.get("product_name") or
-                                    item.get("title") or "—")
-                            sku  = (item.get("sku") or item.get("product_id") or
-                                    item.get("offer_id") or "—")
-                            qty  = (item.get("quantity") or item.get("qty") or
-                                    item.get("count") or "—")
+                            name = (item.get("name") or item.get("product_name") or item.get("title") or "—")
+                            sku  = (item.get("sku") or item.get("product_id") or item.get("offer_id") or "—")
+                            qty  = (item.get("quantity") or item.get("qty") or item.get("count") or "—")
                             lines.append(f"   🏷 {name}")
                             lines.append(f"      SKU: {sku} | Кол-во: {qty}")
                     else:
-                        lines.append(f"   ℹ️ Ключи ответа: {list(bundle_data.keys())}")
+                        lines.append(f"   ℹ️ Ключи bundle: {list(bundle_data.keys())}")
             lines.append("")
 
     return "\n".join(lines)
@@ -311,7 +305,7 @@ async def cmd_start(message: types.Message):
 async def on_menu(callback: CallbackQuery):
     await callback.answer()
     await callback.message.edit_text(
-        "👋 Привет! Я бот для управленИИ заявками на поставку Ozon FBO.\n\n"
+        "👋 Привет! Я бот для управления заявками на поставку Ozon FBO.\n\n"
         "Выбери действие:",
         reply_markup=main_keyboard()
     )
@@ -370,16 +364,21 @@ async def on_clusters(callback: CallbackQuery):
 async def on_cluster_detail(callback: CallbackQuery):
     await callback.answer()
     idx = int(callback.data.split(":")[1])
-    await callback.message.edit_text("⏳ Загружаю данные кластера...")
+    try:
+        await callback.message.edit_text("⏳ Загружаю данные кластера...")
+    except Exception:
+        pass  # Игнорируем "message not modified"
     try:
         text = await get_cluster_details(callback.from_user.id, idx)
-        # Telegram лимит 4096 символов
         if len(text) > 4000:
             text = text[:4000] + "\n...(обрезано)"
         await callback.message.edit_text(text, reply_markup=back_keyboard())
     except Exception as e:
         logger.exception("cluster detail error")
-        await callback.message.edit_text(f"❗ Ошибка: {str(e)}", reply_markup=back_keyboard())
+        try:
+            await callback.message.edit_text(f"❗ Ошибка: {str(e)}", reply_markup=back_keyboard())
+        except Exception:
+            pass
 
 
 async def main():
