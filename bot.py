@@ -11,7 +11,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 # ===== НАСТРОЙКИ =====
 OZON_CLIENT_ID = "1360213"
 OZON_API_KEY = "dd0e57bc-1497-4e70-a642-63266dbddcc7"
-TELEGRAM_TOKEN = "8801888159:AAFcWO2NXH-iLmEQXnCIz0XrJGmnXJhvCUw"
+TELEGRAM_TOKEN = "8801888159:AAFJIece-JoNfGvg9PP5brVygU46_XdRbU0"
 OZON_API_URL = "https://api-seller.ozon.ru"
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
@@ -58,19 +58,12 @@ async def get_supply_orders(session):
     if not order_ids:
         return []
 
-    # Шаг 2: получаем детали каждой заявки через /v3/supply-order/get
-    orders = []
-    for oid in order_ids:
-        try:
-            detail = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
-                "order_id": oid
-            })
-            order = detail.get("order", detail)
-            if order:
-                orders.append(order)
-        except Exception as e:
-            logger.warning(f"Не удалось получить заявку {oid}: {e}")
-    return orders
+    # Шаг 2: получаем детали всех заявок одним запросом
+    detail = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
+        "order_ids": order_ids
+    })
+    logger.info(f"supply-order/get response: {str(detail)[:500]}")
+    return detail.get("orders", [])
 
 async def get_timeslots(session, supply_order_id, date_from, date_to):
     data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/list", {
