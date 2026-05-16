@@ -91,8 +91,10 @@ async def get_timeslots(session, supply_order_id, date_from, date_to):
 async def update_timeslot(session, supply_order_id, time_from, time_to):
     return await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/update", {
         "supply_order_id": supply_order_id,
-        "from": time_from,
-        "to": time_to
+        "timeslot": {
+            "from": time_from,
+            "to": time_to
+        }
     })
 
 # ===== ЛОГИКА =====
