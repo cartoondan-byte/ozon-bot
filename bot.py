@@ -75,8 +75,8 @@ async def get_all_active_orders(session, max_orders=2000):
 
     # Получаем детали батчами по 100
     all_orders = []
-    for i in range(0, len(all_ids), 100):
-        batch = all_ids[i:i+100]
+    for i in range(0, len(all_ids), 50):
+        batch = all_ids[i:i+50]
         details = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
             "order_ids": batch
         })
