@@ -11,7 +11,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQu
 # ===== НАСТРОЙКИ =====
 OZON_CLIENT_ID = "1360213"
 OZON_API_KEY = "dd0e57bc-1497-4e70-a642-63266dbddcc7"
-TELEGRAM_TOKEN = "8917837150:AAHh0wOEyTCAub4_FsD3FDqG0uqdO9yZros"
+TELEGRAM_TOKEN = "8801888159:AAFJIece-JoNfGvg9PP5brVygU46_XdRbU0"
 OZON_API_URL = "https://api-seller.ozon.ru"
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
@@ -66,11 +66,12 @@ async def get_supply_orders(session):
     return detail.get("orders", [])
 
 async def get_timeslots(session, supply_order_id, date_from, date_to):
-    data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/list", {
+    data = await ozon_post(session, f"{OZON_API_URL}/v2/supply-order/timeslot/list", {
         "supply_order_id": supply_order_id,
         "date_from": date_from,
         "date_to": date_to
     })
+    logger.info(f"timeslot response: {str(data)[:300]}")
     return data.get("timeslots", [])
 
 async def update_timeslot(session, supply_order_id, timeslot_id):
@@ -82,8 +83,12 @@ async def update_timeslot(session, supply_order_id, timeslot_id):
 # ===== ЛОГИКА =====
 
 def is_target_status(status: str) -> bool:
-    skip = ["ready", "completed", "готово", "ready_to_supply"]
-    return not any(x in status.lower() for x in skip)
+    # Берём только заявки в статусе "заполнение данных" / data_filling
+    # Пропускаем готовые, архивные и старые
+    target = ["data_filling", "заполнение", "filling", "draft"]
+    s = status.lower()
+    logger.info(f"Checking status: {status}")
+    return any(x in s for x in target)
 
 def find_best_timeslot(timeslots):
     for slot in timeslots:
