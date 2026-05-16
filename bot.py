@@ -27,19 +27,17 @@ HEADERS = {
 # ===== OZON API =====
 
 async def ozon_post(session, url, payload, retry=3):
-    """Запрос к Ozon API с автоматическим retry при rate limit"""
     for attempt in range(retry):
-        await asyncio.sleep(2)  # пауза перед каждым запросом
+        await asyncio.sleep(2)
         async with session.post(url, json=payload, headers=HEADERS) as resp:
             text = await resp.text()
             logger.info(f"POST {url} status={resp.status} body={text[:300]}")
 
             if resp.status == 429:
                 wait = 5 * (attempt + 1)
-                logger.warning(f"Rate limit, ждём {wait} сек (попытка {attempt+1})")
+                logger.warning(f"Rate limit, ждём {wait} сек")
                 await asyncio.sleep(wait)
                 continue
-
             if resp.status == 403:
                 raise Exception("Нет доступа (403). Проверь права API-ключа.")
             if resp.status == 401:
@@ -55,7 +53,6 @@ async def ozon_post(session, url, payload, retry=3):
 
 
 async def get_supply_orders(session):
-    """Получить заявки со статусом DATA_FILLING"""
     data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
         "limit": 50,
         "from_supply_order_id": 0,
@@ -71,15 +68,12 @@ async def get_supply_orders(session):
         "order_ids": order_ids
     })
     all_orders = details.get("orders", [])
-
-    # Фильтруем только DATA_FILLING
     result = [o for o in all_orders if o.get("state", "") == "DATA_FILLING"]
-    logger.info(f"Всего заявок: {len(all_orders)}, DATA_FILLING: {len(result)}")
+    logger.info(f"Всего: {len(all_orders)}, DATA_FILLING: {len(result)}")
     return result
 
 
 async def get_timeslots(session, supply_order_id, date_from, date_to):
-    """Получить доступные таймслоты"""
     data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/get", {
         "supply_order_id": supply_order_id,
         "date_from": date_from,
@@ -89,7 +83,6 @@ async def get_timeslots(session, supply_order_id, date_from, date_to):
 
 
 async def update_timeslot(session, supply_order_id, time_from, time_to):
-    """Установить новый таймслот"""
     return await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/update", {
         "supply_order_id": supply_order_id,
         "timeslot": {
@@ -101,31 +94,51 @@ async def update_timeslot(session, supply_order_id, time_from, time_to):
 
 # ===== ЛОГИКА =====
 
-def find_best_slot(timeslots, tomorrow_date):
-    """Найти слот 19:00-20:00 начиная с завтра, иначе первый доступный"""
+def get_current_date(order):
+    """Получить текущую дату отгрузки заявки"""
+    # Пробуем разные поля где может лежать текущий таймслот
+    timeslot = order.get("timeslot") or order.get("time_slot") or {}
+    from_str = timeslot.get("from") or order.get("shipment_date") or order.get("date_from")
+    if from_str:
+        try:
+            dt = datetime.fromisoformat(from_str.replace("Z", "+00:00"))
+            return dt.astimezone(MOSCOW_TZ).date()
+        except Exception:
+            pass
+    return None
+
+
+def find_best_slot(timeslots, target_date):
+    """
+    Найти слот 19:00-20:00 на target_date.
+    Если нет — любой 19:00 после target_date.
+    Если нет — первый доступный после target_date.
+    """
     future = []
     for s in timeslots:
         try:
             dt = datetime.fromisoformat(s["from"].replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
-            if dt.date() >= tomorrow_date:
+            if dt.date() >= target_date:
                 future.append((dt, s))
         except Exception:
             pass
 
+    future.sort(key=lambda x: x[0])
+
     if not future:
         return None
 
-    # Сначала ищем 19:00 завтра
+    # 1. Ищем 19:00 именно на target_date
     for dt, s in future:
-        if dt.date() == tomorrow_date and dt.hour == 19:
+        if dt.date() == target_date and dt.hour == 19:
             return s
 
-    # Потом любое 19:00
+    # 2. Ищем любой 19:00 после target_date
     for dt, s in future:
         if dt.hour == 19:
             return s
 
-    # Иначе первый доступный
+    # 3. Первый доступный
     return future[0][1]
 
 
@@ -135,15 +148,10 @@ def format_slot(slot):
         dt_to = datetime.fromisoformat(slot["to"].replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
         return f"{dt_from.strftime('%d.%m.%Y %H:%M')}–{dt_to.strftime('%H:%M')}"
     except Exception:
-        return f"{slot.get('from', '?')} – {slot.get('to', '?')}"
+        return f"{slot.get('from', '?')}"
 
 
 async def process_orders() -> str:
-    now = datetime.now(MOSCOW_TZ)
-    tomorrow = now + timedelta(days=1)
-    date_from = tomorrow.strftime("%Y-%m-%dT00:00:00+03:00")
-    date_to = (now + timedelta(days=8)).strftime("%Y-%m-%dT23:59:59+03:00")
-
     results, errors = [], []
 
     async with aiohttp.ClientSession() as session:
@@ -157,16 +165,29 @@ async def process_orders() -> str:
             onum = order.get("order_number", str(oid))
 
             try:
-                slots = await get_timeslots(session, oid, date_from, date_to)
-                logger.info(f"Заявка {onum}: найдено слотов {len(slots)}")
+                # Определяем текущую дату заявки
+                current_date = get_current_date(order)
+                if current_date:
+                    target_date = current_date + timedelta(days=1)
+                    logger.info(f"Заявка {onum}: текущая дата {current_date}, цель {target_date}")
+                else:
+                    # Если не можем определить — берём завтра от сегодня
+                    target_date = datetime.now(MOSCOW_TZ).date() + timedelta(days=1)
+                    logger.info(f"Заявка {onum}: дата не определена, цель {target_date}")
 
-                best = find_best_slot(slots, tomorrow.date())
+                date_from = datetime.combine(target_date, datetime.min.time()).strftime("%Y-%m-%dT00:00:00+03:00")
+                date_to = (datetime.combine(target_date, datetime.min.time()) + timedelta(days=7)).strftime("%Y-%m-%dT23:59:59+03:00")
+
+                slots = await get_timeslots(session, oid, date_from, date_to)
+                logger.info(f"Заявка {onum}: найдено слотов {len(slots)}: {slots[:2]}")
+
+                best = find_best_slot(slots, target_date)
                 if not best:
-                    errors.append(f"❌ {onum}: нет доступных слотов на 8 дней")
+                    errors.append(f"❌ {onum}: нет доступных слотов начиная с {target_date.strftime('%d.%m.%Y')}")
                     continue
 
                 result = await update_timeslot(session, oid, best["from"], best["to"])
-                logger.info(f"Update result: {result}")
+                logger.info(f"Update result для {onum}: {result}")
 
                 if not result.get("error"):
                     results.append(f"✅ {onum} → {format_slot(best)}")
@@ -212,8 +233,8 @@ def again_keyboard():
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Привет! Я бот для переноса заявок на поставку Ozon FBO.\n\n"
-        "Переношу все заявки со статусом «Заполнение данных» на завтра (19:00–20:00).\n"
-        "Если слот недоступен — нахожу ближайший доступный.\n\n"
+        "Переношу каждую заявку со статусом «Заполнение данных» "
+        "на следующий день от её текущей даты (в слот 19:00–20:00).\n\n"
         "Заявки со статусом «Готово» не трогаю.",
         reply_markup=main_keyboard()
     )
@@ -222,7 +243,7 @@ async def cmd_start(message: types.Message):
 @dp.callback_query(F.data == "reschedule")
 async def on_reschedule(callback: CallbackQuery):
     await callback.answer()
-    await callback.message.edit_text("⏳ Обрабатываю заявки, подождите (займёт ~30 сек)...")
+    await callback.message.edit_text("⏳ Обрабатываю заявки, подождите (~30 сек)...")
     try:
         result = await process_orders()
     except Exception as e:
