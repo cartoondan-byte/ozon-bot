@@ -105,7 +105,7 @@ def get_current_order_date(order):
 async def process_reschedule() -> str:
     results, errors = [], []
     today = datetime.now(MOSCOW_TZ).date()
-    deadline = today + timedelta(days=5)  # отбираем заявки с датой до сегодня+5
+    deadline = today + timedelta(days=6)  # отбираем заявки с датой до сегодня+6
 
     async with aiohttp.ClientSession() as session:
         orders = await get_data_filling_orders(session)
@@ -187,7 +187,7 @@ def again_keyboard():
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Привет! Я бот для переноса заявок на поставку Ozon FBO.\n\n"
-        "Нажми кнопку, чтобы перенести заявки с датой отгрузки в ближайшие 5 дней.",
+        "Нажми кнопку, чтобы перенести заявки с датой отгрузки в ближайшие 6 дней.",
         reply_markup=main_keyboard()
     )
 
