@@ -405,7 +405,7 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
         if bid not in bundle_to_orders:
             bundle_to_orders[bid] = []
         bundle_to_orders[bid].append(order)
-    logger.info(f"DATA_FILLING заявок: {len(df_orders)}, уникальных bundle: {len(bundle_to_orders)}")
+    logger.info(f"DATA_FILLING заявок: {len(df_orders)}, уникальных bundle: {len(bundle_to_orders)}, bundle_ids: {list(bundle_to_orders.keys())}")
 
     async with aiohttp.ClientSession() as session:
         for bundle_id, b_orders in bundle_to_orders.items():
