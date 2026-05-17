@@ -76,23 +76,10 @@ async def get_all_active_orders(session, max_orders=10000):
 
 
 async def get_data_filling_orders_fast(session, max_orders=10000):
-    """
-    Получить DATA_FILLING заявки DESC (новые) + первые 2000 ASC (старые) для захвата всех bundle.
-    Выполняем последовательно чтобы не перегружать соединение.
-    """
-    new_orders = await _fetch_orders_by_states(session, states=[1], max_orders=max_orders, sort_direction=2)
-    # Небольшая пауза между двумя большими запросами
-    await asyncio.sleep(2)
-    old_orders = await _fetch_orders_by_states(session, states=[1], max_orders=2000, sort_direction=1)
-    seen = set()
-    result = []
-    for o in new_orders + old_orders:
-        oid = o.get("order_id")
-        if oid not in seen:
-            seen.add(oid)
-            result.append(o)
-    logger.info(f"DATA_FILLING total: {len(result)} (новых DESC: {len(new_orders)}, старых ASC: {len(old_orders)})")
-    return result
+    """Получить DATA_FILLING заявки — один проход DESC (новые сначала)."""
+    orders = await _fetch_orders_by_states(session, states=[1], max_orders=max_orders, sort_direction=2)
+    logger.info(f"DATA_FILLING получено: {len(orders)}")
+    return orders
 
 
 async def _fetch_orders_by_states(session, states: list, max_orders=10000, sort_direction=1):
@@ -184,7 +171,7 @@ async def get_bundle_items_fast(session, bundle_id):
     try:
         data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle", {
             "bundle_ids": [bundle_id],
-            "limit": 1000,
+            "limit": 100,
             "last_id": ""
         }, delay=0.3)
         return data
