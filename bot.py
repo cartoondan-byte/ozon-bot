@@ -5,12 +5,12 @@ import json
 from datetime import datetime, timedelta
 import pytz
 import aiohttp
+import os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # ===== НАСТРОЙКИ =====
-import os
 OZON_CLIENT_ID = os.environ["OZON_CLIENT_ID"]
 OZON_API_KEY   = os.environ["OZON_API_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
