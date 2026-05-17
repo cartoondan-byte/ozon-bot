@@ -265,6 +265,13 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
     all_orders = cluster["orders"]
     logger.info(f"Всего заявок в кластере: {len(all_orders)}")
 
+    # ── ДИАГНОСТИКА: смотрим на структуру первых 3 заявок ─────────────────
+    for o in all_orders[:3]:
+        logger.info(
+            f"[ДИАГН] state={o.get('state')} | order_number={o.get('order_number')} | "
+            f"supplies={json.dumps(o.get('supplies', []), ensure_ascii=False, default=str)[:500]}"
+        )
+
     # ── Шаг 1: собираем уникальные bundle_id из ВСЕХ supplies ВСЕХ заявок ─────
     # ВАЖНО: НЕ дедуплицируем заявки по order_id — он является родительским ID
     # и может быть общим для многих supply orders. Ранее дедупликация по order_id
