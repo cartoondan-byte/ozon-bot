@@ -129,22 +129,39 @@ async def get_cluster_names(session):
 
 async def get_warehouse_names(session):
     """
-    Получить маппинг warehouse_id → название склада через /v1/warehouse/fbo/list.
-    Возвращает: {"12345": "Хоругвино", ...}
+    Получить маппинг warehouse_id → название склада.
+    Пробуем несколько эндпоинтов, собираем объединённый результат.
     """
-    try:
-        data = await ozon_post(session, f"{OZON_API_URL}/v1/warehouse/fbo/list", {})
-        result = {}
-        for wh in data.get("warehouses", []):
-            wid = str(wh.get("warehouse_id", "") or wh.get("id", ""))
-            name = wh.get("name", "") or wh.get("warehouse_name", "")
+    result = {}
+
+    def _parse(wh_list):
+        for wh in wh_list:
+            wid  = str(wh.get("warehouse_id") or wh.get("id") or "")
+            name = wh.get("name") or wh.get("warehouse_name") or ""
             if wid and name:
                 result[wid] = name
-        logger.info(f"Warehouse names: {result}")
-        return result
+
+    # /v1/warehouse/fbo/list требует filter_by_supply_type — пробуем оба значения
+    for supply_type in ["TYPE_CROSSDOCK", "TYPE_DIRECT"]:
+        try:
+            data = await ozon_post(session, f"{OZON_API_URL}/v1/warehouse/fbo/list", {
+                "filter_by_supply_type": supply_type
+            })
+            _parse(data.get("warehouses", []))
+            logger.info(f"fbo/list [{supply_type}]: {len(data.get('warehouses', []))} складов")
+        except Exception as e:
+            logger.warning(f"fbo/list [{supply_type}] error: {e}")
+
+    # Фоллбэк: /v2/warehouse/list — общий список складов продавца
+    try:
+        data = await ozon_post(session, f"{OZON_API_URL}/v2/warehouse/list", {})
+        _parse(data.get("result", []))
+        logger.info(f"v2/warehouse/list: {len(data.get('result', []))} складов")
     except Exception as e:
-        logger.warning(f"Warehouse names error: {e}")
-        return {}
+        logger.warning(f"v2/warehouse/list error: {e}")
+
+    logger.info(f"Итого складов: {len(result)}, маппинг: {result}")
+    return result
 
 
 async def get_bundle_items_fast(session, bundle_id):
@@ -263,6 +280,22 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
     # Фильтруем только DATA_FILLING
     df_orders = [o for o in all_orders if o.get("state") == "DATA_FILLING"]
     logger.info(f"DATA_FILLING заявок: {len(df_orders)} из {len(all_orders)} активных")
+
+
+    # ДИАГНОСТИКА: логируем структуру первых 5 заявок
+    for order in df_orders[:5]:
+        sup = (order.get('supplies') or [{}])[0]
+        logger.info(
+            f"DIAG order={order.get('order_number')} "
+            f"cluster_id={sup.get('macrolocal_cluster_id')!r} "
+            f"warehouse_id={sup.get('warehouse_id')!r} "
+            f"storage_wh_id={sup.get('storage_warehouse_id')!r} "
+            f"wh_name={sup.get('warehouse_name')!r} "
+            f"dest={order.get('destination_place_name')!r} "
+            f"supply_type={order.get('supply_type')!r} "
+            f"order_tags={order.get('order_tags')!r} "
+            f"supply_keys={list(sup.keys())}"
+        )
 
     # Группировка: новые заявки — по macrolocal_cluster_id, старые — по warehouse_id напрямую.
     # Ключи с префиксами "cluster:" и "wh:" исключают коллизии одинаковых числовых ID.
