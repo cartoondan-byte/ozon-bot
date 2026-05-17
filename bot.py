@@ -5,15 +5,14 @@ import json
 from datetime import datetime, timedelta
 import pytz
 import aiohttp
-import os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 # ===== НАСТРОЙКИ =====
-OZON_CLIENT_ID = os.environ["OZON_CLIENT_ID"]
-OZON_API_KEY   = os.environ["OZON_API_KEY"]
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+OZON_CLIENT_ID = "1408626"
+OZON_API_KEY = "b96a8e5a-092b-44d8-ac4f-a6dc36d1a4fc"
+TELEGRAM_TOKEN = "8917837150:AAHh0wOEyTCAub4_FsD3FDqG0uqdO9yZros"
 OZON_API_URL = "https://api-seller.ozon.ru"
 MOSCOW_TZ = pytz.timezone("Europe/Moscow")
 
@@ -111,6 +110,7 @@ async def get_all_active_orders(session):
                 "from_supply_order_id": last_id,
                 "sort_by": 1,
                 "sort_direction": 2,
+                "filter": {},
             }, delay=0.1)
             page_ids = data.get("order_ids", [])
             if not page_ids:
