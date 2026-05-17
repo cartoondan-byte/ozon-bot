@@ -106,14 +106,14 @@ async def _fetch_orders_by_states(session, states: list, max_orders=10000, sort_
         return []
 
     all_orders = []
-    for i in range(0, len(all_ids), 50):
-        batch = all_ids[i:i+50]
+    for i in range(0, len(all_ids), 100):
+        batch = all_ids[i:i+100]
         details = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
             "order_ids": batch
         }, retry=5, delay=1.0)
         all_orders.extend(details.get("orders", []))
-        # Пауза каждые 500 заявок чтобы не перегружать соединение
-        if i > 0 and i % 500 == 0:
+        # Пауза каждые 1000 заявок
+        if i > 0 and i % 1000 == 0:
             await asyncio.sleep(3)
 
     logger.info(f"states={states} dir={sort_direction}: ID={len(all_ids)}, получено={len(all_orders)}")
@@ -276,11 +276,94 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
             logger.info(f"Кэш устарел ({int(age)}с > {CACHE_TTL_SECONDS}с), обновляем")
 
     async with aiohttp.ClientSession() as session:
-        df_orders     = await get_data_filling_orders_fast(session)
         cluster_names = await get_cluster_names(session)
         wh_names      = await get_warehouse_names(session)
 
-    logger.info(f"DATA_FILLING заявок получено: {len(df_orders)}")
+        # Умная загрузка: грузим порциями по 500, пока не стабилизируется
+        # число кластеров и уникальных bundle (обычно хватает 500-1000 заявок)
+        df_orders = []
+        seen_clusters = set()
+        seen_bundles  = set()
+        stable_rounds = 0
+        last_cluster_count = 0
+        last_bundle_count  = 0
+
+        async def fetch_batch(from_id, limit=500):
+            ids = []
+            last = from_id
+            while len(ids) < limit:
+                data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
+                    "limit": 100,
+                    "from_supply_order_id": last,
+                    "sort_by": 1,
+                    "sort_direction": 2,
+                    "filter": {"states": [1]}
+                })
+                page = data.get("order_ids", [])
+                if not page:
+                    break
+                ids.extend(page)
+                if len(page) < 100:
+                    break
+                last = page[-1]
+                if len(ids) >= limit:
+                    break
+
+            if not ids:
+                return [], 0
+
+            orders = []
+            for i in range(0, len(ids), 100):
+                batch = ids[i:i+100]
+                det = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
+                    "order_ids": batch
+                }, retry=5, delay=1.0)
+                orders.extend(det.get("orders", []))
+            return orders, ids[-1] if ids else 0
+
+        from_id = 0
+        for round_num in range(10):  # максимум 10 раундов × 500 = 5000
+            batch_orders, last_id = await fetch_batch(from_id, limit=500)
+            if not batch_orders:
+                break
+            
+            df_orders.extend(batch_orders)
+            from_id = last_id
+
+            # Считаем уникальные кластеры и bundle в новой порции
+            for o in batch_orders:
+                supplies = o.get("supplies", [])
+                sup = supplies[0] if supplies else {}
+                storage_clusters = o.get("storageClusters") or o.get("storage_clusters") or []
+                sc = storage_clusters[0] if storage_clusters else {}
+                cid = str(sc.get("id") or sup.get("macrolocal_cluster_id") or "")
+                bid = sup.get("bundle_id") or ""
+                if cid:
+                    seen_clusters.add(cid)
+                if bid:
+                    seen_bundles.add(bid)
+
+            logger.info(f"Раунд {round_num+1}: загружено {len(df_orders)} заявок, "
+                        f"кластеров={len(seen_clusters)}, bundle={len(seen_bundles)}")
+
+            # Если кластеры и bundle не растут 2 раунда подряд — хватит
+            if len(seen_clusters) == last_cluster_count and len(seen_bundles) == last_bundle_count:
+                stable_rounds += 1
+                if stable_rounds >= 2:
+                    logger.info("Кластеры и bundle стабилизировались, прекращаем загрузку")
+                    break
+            else:
+                stable_rounds = 0
+
+            last_cluster_count = len(seen_clusters)
+            last_bundle_count  = len(seen_bundles)
+
+            # Если достигли всех известных кластеров (22) и bundle не растут
+            if len(seen_clusters) >= 22 and stable_rounds >= 1:
+                logger.info(f"Все кластеры найдены ({len(seen_clusters)}), останавливаемся")
+                break
+
+    logger.info(f"DATA_FILLING итого: {len(df_orders)} заявок, {len(seen_clusters)} кластеров, {len(seen_bundles)} bundle")
 
 
 
@@ -519,6 +602,7 @@ def main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 Перенести заявки на день вперёд", callback_data="reschedule")],
         [InlineKeyboardButton(text="🔍 Поиск по кластерам и SKU",        callback_data="clusters")],
+        [InlineKeyboardButton(text="🧪 Найти все артикулы в заявках",    callback_data="scan_skus")],
     ])
 
 
@@ -686,6 +770,120 @@ def _build_clusters_screen(cluster_list: list, uid: int) -> tuple[str, InlineKey
     buttons.append([InlineKeyboardButton(text="🏠 Главное меню",    callback_data="menu")])
 
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.callback_query(F.data == "scan_skus")
+async def on_scan_skus(callback: CallbackQuery):
+    """Сканирует заявки и выводит все уникальные артикулы."""
+    await callback.answer()
+    await callback.message.edit_text("⏳ Сканирую заявки в поисках уникальных артикулов...\n(загружаю порциями по 500)")
+
+    found_skus = {}   # sku -> {name, bundle_id, order_number}
+    seen_bundles = set()
+    from_id = 0
+    total_loaded = 0
+
+    async with aiohttp.ClientSession() as session:
+        for round_num in range(20):  # максимум 20 порций × 500 = 10000
+            # Грузим 500 ID
+            ids = []
+            last = from_id
+            while len(ids) < 500:
+                data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
+                    "limit": 100,
+                    "from_supply_order_id": last,
+                    "sort_by": 1,
+                    "sort_direction": 2,
+                    "filter": {"states": [1]}
+                })
+                page = data.get("order_ids", [])
+                if not page:
+                    break
+                ids.extend(page)
+                if len(page) < 100:
+                    break
+                last = page[-1]
+            
+            if not ids:
+                break
+            from_id = ids[-1]
+
+            # Получаем детали
+            orders = []
+            for i in range(0, len(ids), 100):
+                det = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
+                    "order_ids": ids[i:i+100]
+                }, retry=5, delay=1.0)
+                orders.extend(det.get("orders", []))
+            total_loaded += len(orders)
+
+            # Собираем новые bundle
+            new_bundles = []
+            for o in orders:
+                supplies = o.get("supplies", [])
+                sup = supplies[0] if supplies else {}
+                bid = sup.get("bundle_id") or ""
+                if bid and bid not in seen_bundles:
+                    seen_bundles.add(bid)
+                    new_bundles.append((bid, o))
+
+            # Запрашиваем bundle только для новых
+            for bid, order in new_bundles:
+                try:
+                    bd = await get_bundle_items_fast(session, bid)
+                    items = bd.get("items") or []
+                    for item in items:
+                        sku = str(item.get("sku") or item.get("product_id") or "")
+                        if sku and sku not in found_skus:
+                            found_skus[sku] = {
+                                "name": item.get("name") or "—",
+                                "bundle_id": bid[:8],
+                                "order": order.get("order_number", "?"),
+                            }
+                except Exception:
+                    pass
+
+            logger.info(f"Скан раунд {round_num+1}: загружено {total_loaded}, bundle={len(seen_bundles)}, SKU={len(found_skus)}")
+
+            # Обновляем сообщение прогресса каждые 2 раунда
+            if round_num % 2 == 1:
+                try:
+                    await callback.message.edit_text(
+                        f"⏳ Сканирую... загружено {total_loaded} заявок\n"
+                        f"Найдено bundle: {len(seen_bundles)}, артикулов: {len(found_skus)}"
+                    )
+                except Exception:
+                    pass
+
+            # Если новых bundle не появилось 2 раунда подряд — хватит
+            if not new_bundles and round_num > 0:
+                break
+
+    # Формируем результат
+    if not found_skus:
+        text = "❌ Артикулов не найдено"
+    else:
+        lines = [
+            f"✅ Найдено *{len(found_skus)} уникальных артикулов* из {total_loaded} заявок:\n"
+        ]
+        for sku, info in found_skus.items():
+            name = info["name"][:50] + "…" if len(info["name"]) > 50 else info["name"]
+            lines.append(f"🏷 *{sku}*")
+            lines.append(f"   {name}")
+            lines.append(f"   Bundle: {info['bundle_id']}...")
+            lines.append("")
+        text = "\n".join(lines)
+
+    if len(text) > 4000:
+        text = text[:4000] + "\n...(обрезано)"
+
+    await callback.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")]
+        ]),
+        parse_mode="Markdown"
+    )
 
 
 @dp.callback_query(F.data == "clusters")
