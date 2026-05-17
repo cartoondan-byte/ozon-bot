@@ -64,6 +64,16 @@ async def ozon_post(session, url, payload, retry=3, delay=0.5):
 
 async def get_all_active_orders(session, max_orders=10000):
     """Получить все активные заявки с пагинацией."""
+    return await _fetch_orders_by_states(session, states=[1,2,3,4,5,6,7,8,9,10], max_orders=max_orders)
+
+
+async def get_data_filling_orders_fast(session, max_orders=10000):
+    """Получить только DATA_FILLING заявки — фильтр state=1 на стороне API."""
+    return await _fetch_orders_by_states(session, states=[1], max_orders=max_orders)
+
+
+async def _fetch_orders_by_states(session, states: list, max_orders=10000):
+    """Базовая функция: получить заявки с заданными статусами."""
     all_ids = []
     last_id = 0
     while len(all_ids) < max_orders:
@@ -72,7 +82,7 @@ async def get_all_active_orders(session, max_orders=10000):
             "from_supply_order_id": last_id,
             "sort_by": 1,
             "sort_direction": 1,
-            "filter": {"states": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}
+            "filter": {"states": states}
         })
         page_ids = data.get("order_ids", [])
         if not page_ids:
@@ -93,16 +103,13 @@ async def get_all_active_orders(session, max_orders=10000):
         })
         all_orders.extend(details.get("orders", []))
 
-    skip = {"CANCELLED", "COMPLETED", "REJECTED"}
-    active = [o for o in all_orders if o.get("state", "") not in skip]
-    logger.info(f"Всего ID: {len(all_ids)}, получено: {len(all_orders)}, активных: {len(active)}")
-    return active
+    logger.info(f"states={states}: ID={len(all_ids)}, получено={len(all_orders)}")
+    return all_orders
 
 
 async def get_data_filling_orders(session):
-    """Только DATA_FILLING."""
-    orders = await get_all_active_orders(session)
-    return [o for o in orders if o.get("state") == "DATA_FILLING"]
+    """Только DATA_FILLING — используем быстрый фильтр по state=1."""
+    return await get_data_filling_orders_fast(session)
 
 
 async def get_cluster_names(session):
@@ -169,7 +176,7 @@ async def get_bundle_items_fast(session, bundle_id):
     try:
         data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle", {
             "bundle_ids": [bundle_id],
-            "limit": 100,
+            "limit": 1000,
             "last_id": ""
         }, delay=0.3)
         return data
@@ -274,13 +281,11 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
             logger.info(f"Кэш устарел ({int(age)}с > {CACHE_TTL_SECONDS}с), обновляем")
 
     async with aiohttp.ClientSession() as session:
-        all_orders   = await get_all_active_orders(session)
+        df_orders     = await get_data_filling_orders_fast(session)
         cluster_names = await get_cluster_names(session)
         wh_names      = await get_warehouse_names(session)
 
-    # Фильтруем только DATA_FILLING
-    df_orders = [o for o in all_orders if o.get("state") == "DATA_FILLING"]
-    logger.info(f"DATA_FILLING заявок: {len(df_orders)} из {len(all_orders)} активных")
+    logger.info(f"DATA_FILLING заявок получено: {len(df_orders)}")
 
 
 
@@ -405,7 +410,7 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
         if bid not in bundle_to_orders:
             bundle_to_orders[bid] = []
         bundle_to_orders[bid].append(order)
-    logger.info(f"DATA_FILLING заявок: {len(df_orders)}, уникальных bundle: {len(bundle_to_orders)}, bundle_ids: {list(bundle_to_orders.keys())}")
+    logger.info(f"DATA_FILLING заявок в кластере: {len(df_orders)}, уникальных bundle: {len(bundle_to_orders)}, примеры bundle: {list(bundle_to_orders.keys())[:5]}")
 
     async with aiohttp.ClientSession() as session:
         for bundle_id, b_orders in bundle_to_orders.items():
