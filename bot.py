@@ -43,23 +43,31 @@ STATE_NAMES = {
 
 # ===== OZON API =====
 
-async def ozon_post(session, url, payload, retry=3, delay=0.5):
+async def ozon_post(session, url, payload, retry=5, delay=0.5):
+    import aiohttp as _aiohttp
     for attempt in range(retry):
         await asyncio.sleep(delay)
-        async with session.post(url, json=payload, headers=HEADERS) as resp:
-            text = await resp.text()
-            logger.info(f"POST {url} status={resp.status}")
-            if resp.status == 429:
-                wait = 15 * (attempt + 1)
-                logger.warning(f"Rate limit, ждём {wait} сек")
-                await asyncio.sleep(wait)
-                continue
-            if resp.status in (401, 403, 404):
-                raise Exception(f"Ошибка {resp.status}: {text[:150]}")
-            if resp.status != 200:
-                raise Exception(f"Ошибка {resp.status}: {text[:200]}")
-            return json.loads(text)
-    raise Exception("Превышен лимит запросов, попробуй позже")
+        try:
+            async with session.post(url, json=payload, headers=HEADERS) as resp:
+                text = await resp.text()
+                logger.info(f"POST {url} status={resp.status}")
+                if resp.status == 429:
+                    wait = 15 * (attempt + 1)
+                    logger.warning(f"Rate limit, ждём {wait} сек")
+                    await asyncio.sleep(wait)
+                    continue
+                if resp.status in (401, 403, 404):
+                    raise Exception(f"Ошибка {resp.status}: {text[:150]}")
+                if resp.status != 200:
+                    raise Exception(f"Ошибка {resp.status}: {text[:200]}")
+                return json.loads(text)
+        except (_aiohttp.ServerDisconnectedError, _aiohttp.ClientConnectorError,
+                _aiohttp.ClientOSError) as e:
+            wait = 3 * (attempt + 1)
+            logger.warning(f"Соединение разорвано ({e}), ждём {wait}с, попытка {attempt+1}/{retry}")
+            await asyncio.sleep(wait)
+            continue
+    raise Exception("Сервер недоступен, попробуй позже")
 
 
 async def get_all_active_orders(session, max_orders=10000):
@@ -69,9 +77,12 @@ async def get_all_active_orders(session, max_orders=10000):
 
 async def get_data_filling_orders_fast(session, max_orders=10000):
     """
-    Получить DATA_FILLING заявки: новые (DESC) + старые (ASC) для захвата всех bundle.
+    Получить DATA_FILLING заявки DESC (новые) + первые 2000 ASC (старые) для захвата всех bundle.
+    Выполняем последовательно чтобы не перегружать соединение.
     """
     new_orders = await _fetch_orders_by_states(session, states=[1], max_orders=max_orders, sort_direction=2)
+    # Небольшая пауза между двумя большими запросами
+    await asyncio.sleep(2)
     old_orders = await _fetch_orders_by_states(session, states=[1], max_orders=2000, sort_direction=1)
     seen = set()
     result = []
@@ -112,16 +123,20 @@ async def _fetch_orders_by_states(session, states: list, max_orders=10000, sort_
         batch = all_ids[i:i+50]
         details = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
             "order_ids": batch
-        })
+        }, retry=5, delay=1.0)
         all_orders.extend(details.get("orders", []))
+        # Пауза каждые 500 заявок чтобы не перегружать соединение
+        if i > 0 and i % 500 == 0:
+            await asyncio.sleep(3)
 
-    logger.info(f"states={states}: ID={len(all_ids)}, получено={len(all_orders)}")
+    logger.info(f"states={states} dir={sort_direction}: ID={len(all_ids)}, получено={len(all_orders)}")
     return all_orders
 
 
 async def get_data_filling_orders(session):
     """Только DATA_FILLING — используем быстрый фильтр по state=1."""
     return await get_data_filling_orders_fast(session)
+
 
 
 async def get_cluster_names(session):
