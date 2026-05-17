@@ -620,6 +620,52 @@ def back_keyboard():
     ])
 
 
+@dp.message(F.text.startswith("/raworder"))
+async def cmd_raworder(message: types.Message):
+    """Выводит сырой JSON заявки: /raworder <order_id>"""
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        await message.answer("Использование: /raworder <order_id>\nНапример: /raworder 104983713")
+        return
+    order_id = int(parts[1].strip())
+    await message.answer(f"🔍 Загружаю заявку {order_id}...")
+    async with aiohttp.ClientSession() as session:
+        try:
+            data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
+                "order_ids": [order_id]
+            })
+            orders = data.get("orders", [])
+            if not orders:
+                await message.answer("❌ Заявка не найдена")
+                return
+            o = orders[0]
+            # Показываем ключевые поля
+            supplies = o.get("supplies", [])
+            sup = supplies[0] if supplies else {}
+            lines = [
+                f"📋 Заявка {o.get('order_number')}",
+                f"State: {o.get('state')}",
+                f"",
+                f"storageClusters: {o.get('storageClusters')}",
+                f"storageWarehouses: {o.get('storageWarehouses')}",
+                f"supplyWarehouse: {o.get('supplyWarehouse')}",
+                f"",
+                f"supplies[0] keys: {list(sup.keys())}",
+                f"bundle_id: {sup.get('bundle_id')}",
+                f"macrolocal_cluster_id: {sup.get('macrolocal_cluster_id')}",
+                f"storageClusterId: {sup.get('storageClusterId')}",
+                f"storageWarehouseId: {sup.get('storageWarehouseId')}",
+                f"",
+                f"Все ключи заявки: {list(o.keys())}",
+            ]
+            text = "\n".join(lines)
+            if len(text) > 4000:
+                text = text[:4000]
+            await message.answer(text)
+        except Exception as e:
+            await message.answer(f"❌ Ошибка: {e}")
+
+
 @dp.message(F.text.startswith("/findsku"))
 async def cmd_findsku(message: types.Message):
     """Ищет заявки с конкретным SKU: /findsku 3479900339"""
