@@ -264,57 +264,84 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
     df_orders = [o for o in all_orders if o.get("state") == "DATA_FILLING"]
     logger.info(f"DATA_FILLING заявок: {len(df_orders)} из {len(all_orders)} активных")
 
-    # Группировка по кластерам
-    clusters_map: dict = {}
+    # Группировка: новые заявки — по macrolocal_cluster_id, старые — по warehouse_id напрямую.
+    # Ключи с префиксами "cluster:" и "wh:" исключают коллизии одинаковых числовых ID.
+    groups_map: dict = {}
+
     for order in df_orders:
-        supplies   = order.get("supplies", [])
-        cluster_id = None
-        wh_id      = None
+        supplies = order.get("supplies", [])
+        sup = supplies[0] if supplies else {}
 
-        if supplies:
-            sup = supplies[0]
-            cluster_id = str(sup.get("macrolocal_cluster_id") or "")
-            # warehouse_id может быть в supplies или в order_tags
-            wh_id = str(
-                sup.get("warehouse_id")
-                or sup.get("storage_warehouse_id")
-                or order.get("order_tags", {}).get("seller_warehouse_id")
-                or ""
-            )
+        cluster_id = str(sup.get("macrolocal_cluster_id") or "")
+        wh_id = str(
+            sup.get("warehouse_id")
+            or sup.get("storage_warehouse_id")
+            or order.get("order_tags", {}).get("seller_warehouse_id")
+            or ""
+        )
+        # Текстовое имя склада из самой заявки — помогает для старых заявок
+        wh_name_raw = str(
+            sup.get("warehouse_name")
+            or order.get("destination_place_name")
+            or ""
+        )
 
-        if not cluster_id:
-            cluster_id = "unknown"
-        if not wh_id:
-            wh_id = "unknown"
+        if cluster_id:
+            # ── НОВАЯ заявка: известен кластер ──────────────────────────
+            group_key = f"cluster:{cluster_id}"
+            if group_key not in groups_map:
+                groups_map[group_key] = {
+                    "type":         "cluster",
+                    "id":           cluster_id,
+                    "display_name": cluster_names.get(cluster_id, f"Кластер {cluster_id}"),
+                    "orders":       [],
+                    "warehouses":   {},
+                }
+            groups_map[group_key]["orders"].append(order)
+            sub_key  = wh_id or "unknown"
+            sub_name = wh_names.get(wh_id, wh_name_raw or f"Склад {wh_id}") if wh_id else "Неизвестный склад"
+            if sub_key not in groups_map[group_key]["warehouses"]:
+                groups_map[group_key]["warehouses"][sub_key] = {"name": sub_name, "orders": []}
+            groups_map[group_key]["warehouses"][sub_key]["orders"].append(order)
 
-        if cluster_id not in clusters_map:
-            clusters_map[cluster_id] = {"orders": [], "warehouses": {}}
+        elif wh_id:
+            # ── СТАРАЯ заявка: кластер не указан, группируем по складу ──
+            group_key  = f"wh:{wh_id}"
+            wh_display = wh_names.get(wh_id, wh_name_raw or f"Склад {wh_id}")
+            if group_key not in groups_map:
+                groups_map[group_key] = {
+                    "type":         "warehouse",
+                    "id":           wh_id,
+                    "display_name": f"🏭 {wh_display}",
+                    "orders":       [],
+                    "warehouses":   {wh_id: {"name": wh_display, "orders": []}},
+                }
+            groups_map[group_key]["orders"].append(order)
+            groups_map[group_key]["warehouses"][wh_id]["orders"].append(order)
 
-        clusters_map[cluster_id]["orders"].append(order)
+        else:
+            # ── Без привязки ─────────────────────────────────────────────
+            group_key = "wh:unknown"
+            if group_key not in groups_map:
+                groups_map[group_key] = {
+                    "type":         "warehouse",
+                    "id":           "unknown",
+                    "display_name": "🏭 Склад не определён",
+                    "orders":       [],
+                    "warehouses":   {"unknown": {"name": "Не определён", "orders": []}},
+                }
+            groups_map[group_key]["orders"].append(order)
+            groups_map[group_key]["warehouses"]["unknown"]["orders"].append(order)
 
-        if wh_id not in clusters_map[cluster_id]["warehouses"]:
-            clusters_map[cluster_id]["warehouses"][wh_id] = {"orders": []}
-        clusters_map[cluster_id]["warehouses"][wh_id]["orders"].append(order)
-
-    # Собираем финальный список с именами
+    # Собираем финальный список
     cluster_list = []
-    for cid, cdata in clusters_map.items():
-        display = cluster_names.get(cid, f"Кластер {cid}") if cid != "unknown" else "Без кластера"
-
-        # Обогащаем склады именами
-        warehouses = {}
-        for wid, wdata in cdata["warehouses"].items():
-            wname = wh_names.get(wid, f"Склад {wid}") if wid != "unknown" else "Неизвестный склад"
-            warehouses[wid] = {
-                "name": wname,
-                "orders": wdata["orders"],
-            }
-
+    for gdata in groups_map.values():
         cluster_list.append({
-            "id":           cid,
-            "display_name": display,
-            "orders":       cdata["orders"],
-            "warehouses":   warehouses,
+            "id":           gdata["id"],
+            "type":         gdata["type"],
+            "display_name": gdata["display_name"],
+            "orders":       gdata["orders"],
+            "warehouses":   gdata["warehouses"],
             "names":        cluster_names,
             "wh_names":     wh_names,
         })
@@ -507,6 +534,12 @@ async def on_menu(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "noop")
+async def on_noop(callback: CallbackQuery):
+    """Кнопка-разделитель — ничего не делает."""
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "reschedule")
 async def on_reschedule(callback: CallbackQuery):
     await callback.answer()
@@ -534,23 +567,47 @@ def _build_clusters_screen(cluster_list: list, uid: int) -> tuple[str, InlineKey
     else:
         cache_note = ""
 
+    new_clusters   = [c for c in cluster_list if c.get("type") == "cluster"]
+    old_warehouses = [c for c in cluster_list if c.get("type") == "warehouse"]
     total_df = sum(len(c["orders"]) for c in cluster_list)
+
     text = (
         f"🟡 *Заявки со статусом «Заполнение данных»*\n\n"
         f"Всего заявок: {total_df}\n"
-        f"Кластеров: {len(cluster_list)}\n"
+        f"📍 Кластеры (новые заявки): {len(new_clusters)}\n"
+        f"🏭 Склады (старые заявки): {len(old_warehouses)}\n"
         f"{cache_note}\n\n"
-        f"Выбери кластер для просмотра складов и SKU:"
+        f"Выбери кластер или склад:"
     )
 
     buttons = []
-    for i, cluster in enumerate(cluster_list):
-        count    = len(cluster["orders"])
-        wh_count = len(cluster["warehouses"])
-        buttons.append([InlineKeyboardButton(
-            text=f"📍 {cluster['display_name']} | {count} заявок | {wh_count} склад(ов)",
-            callback_data=f"cluster:{i}"
-        )])
+    # Сначала кластеры, потом склады
+    if new_clusters:
+        for i, cluster in enumerate(cluster_list):
+            if cluster.get("type") != "cluster":
+                continue
+            count    = len(cluster["orders"])
+            wh_count = len(cluster["warehouses"])
+            wh_label = f"{wh_count} склад" if wh_count == 1 else f"{wh_count} склад(ов)"
+            buttons.append([InlineKeyboardButton(
+                text=f"📍 {cluster['display_name']} — {count} заявок ({wh_label})",
+                callback_data=f"cluster:{i}"
+            )])
+
+    if old_warehouses:
+        if new_clusters:
+            buttons.append([InlineKeyboardButton(
+                text="── Старые заявки (по складу) ──",
+                callback_data="noop"
+            )])
+        for i, cluster in enumerate(cluster_list):
+            if cluster.get("type") != "warehouse":
+                continue
+            count = len(cluster["orders"])
+            buttons.append([InlineKeyboardButton(
+                text=f"{cluster['display_name']} — {count} заявок",
+                callback_data=f"cluster:{i}"
+            )])
     buttons.append([InlineKeyboardButton(text="🔄 Обновить данные", callback_data="clusters_refresh")])
     buttons.append([InlineKeyboardButton(text="🏠 Главное меню",    callback_data="menu")])
 
