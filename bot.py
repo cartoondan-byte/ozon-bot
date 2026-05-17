@@ -276,99 +276,11 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
             logger.info(f"Кэш устарел ({int(age)}с > {CACHE_TTL_SECONDS}с), обновляем")
 
     async with aiohttp.ClientSession() as session:
+        df_orders     = await get_data_filling_orders_fast(session)
         cluster_names = await get_cluster_names(session)
         wh_names      = await get_warehouse_names(session)
 
-        # Умная загрузка: грузим порциями по 500, пока не стабилизируется
-        # число кластеров и уникальных bundle (обычно хватает 500-1000 заявок)
-        df_orders = []
-        seen_clusters = set()
-        seen_bundles  = set()
-        stable_rounds = 0
-        last_cluster_count = 0
-        last_bundle_count  = 0
-
-        async def fetch_batch(from_id, limit=500):
-            ids = []
-            last = from_id
-            while len(ids) < limit:
-                data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
-                    "limit": 100,
-                    "from_supply_order_id": last,
-                    "sort_by": 1,
-                    "sort_direction": 2,
-                    "filter": {"states": [1]}
-                })
-                page = data.get("order_ids", [])
-                if not page:
-                    break
-                ids.extend(page)
-                if len(page) < 100:
-                    break
-                last = page[-1]
-                if len(ids) >= limit:
-                    break
-
-            if not ids:
-                return [], 0
-
-            orders = []
-            for i in range(0, len(ids), 50):
-                batch = ids[i:i+50]
-                det = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
-                    "order_ids": batch
-                }, retry=5, delay=1.0)
-                orders.extend(det.get("orders", []))
-            return orders, ids[-1] if ids else 0
-
-        from_id = 0
-        for round_num in range(10):  # максимум 10 раундов × 500 = 5000
-            batch_orders, last_id = await fetch_batch(from_id, limit=500)
-            if not batch_orders:
-                break
-            
-            df_orders.extend(batch_orders)
-            from_id = last_id
-
-            # Считаем уникальные группы и bundle в новой порции
-            for o in batch_orders:
-                supplies = o.get("supplies", [])
-                sup = supplies[0] if supplies else {}
-                storage_clusters = o.get("storageClusters") or o.get("storage_clusters") or []
-                sc = storage_clusters[0] if storage_clusters else {}
-                cid = str(sc.get("id") or sup.get("macrolocal_cluster_id") or "")
-                bid = sup.get("bundle_id") or ""
-                # Для старых заявок считаем склад как отдельную группу
-                old_sw = sup.get("storage_warehouse") or {}
-                old_wh_id = str(old_sw.get("warehouse_id") or "")
-                if cid:
-                    seen_clusters.add(f"cluster:{cid}")
-                elif old_wh_id:
-                    seen_clusters.add(f"wh:{old_wh_id}")
-                if bid:
-                    seen_bundles.add(bid)
-
-            logger.info(f"Раунд {round_num+1}: загружено {len(df_orders)} заявок, "
-                        f"кластеров={len(seen_clusters)}, bundle={len(seen_bundles)}")
-
-            # Если кластеры и bundle не растут 2 раунда подряд — хватит
-            if len(seen_clusters) == last_cluster_count and len(seen_bundles) == last_bundle_count:
-                stable_rounds += 1
-                if stable_rounds >= 2:
-                    logger.info("Кластеры и bundle стабилизировались, прекращаем загрузку")
-                    break
-            else:
-                stable_rounds = 0
-
-            last_cluster_count = len(seen_clusters)
-            last_bundle_count  = len(seen_bundles)
-
-            # Если достигли 30+ групп (кластеры + склады) и bundle стабильны
-            if len(seen_clusters) >= 30 and stable_rounds >= 1:
-                logger.info(f"Достаточно групп найдено ({len(seen_clusters)}), останавливаемся")
-                break
-
-    logger.info(f"DATA_FILLING итого: {len(df_orders)} заявок, {len(seen_clusters)} кластеров, {len(seen_bundles)} bundle")
+    logger.info(f"DATA_FILLING заявок получено: {len(df_orders)}")
 
 
 
