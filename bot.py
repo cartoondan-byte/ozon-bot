@@ -251,11 +251,6 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
     """
     Загрузить SKU для кластера.
     Возвращает {sku: {name, all_count, orders: [5 ближайших DATA_FILLING]}}
-
-    ИСПРАВЛЕНИЯ:
-    - Сначала собираем bundle→SKU маппинг (уникальные bundle_id)
-    - Затем проходим по ВСЕМ заявкам и группируем по SKU
-    - raw_state сохраняется в каждую заявку для корректной фильтрации
     """
     cluster_list = cluster_cache.get(user_id)
     if not cluster_list or cluster_idx >= len(cluster_list):
@@ -269,20 +264,28 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
 
     all_orders = cluster["orders"]
 
-    # ── Шаг 1: собираем уникальные bundle_id ──────────────────────────────────
-    seen_bundles = {}
+    # ── Шаг 0: дедупликация заявок по order_id (пагинация может давать дубли) ─
+    dedup_orders: dict = {}
     for order in all_orders:
-        supplies = order.get("supplies", [])
-        if supplies:
-            bid = supplies[0].get("bundle_id")
-            if bid and bid not in seen_bundles:
-                seen_bundles[bid] = True
+        oid = order.get("order_id") or order.get("supply_order_id") or order.get("order_number")
+        if oid and oid not in dedup_orders:
+            dedup_orders[oid] = order
+    unique_orders = list(dedup_orders.values())
+    logger.info(f"Всего заявок в кластере: {len(all_orders)}, уникальных: {len(unique_orders)}")
 
-    logger.info(f"Всего заявок: {len(all_orders)}, уникальных bundle: {len(seen_bundles)}")
+    # ── Шаг 1: собираем уникальные bundle_id из ВСЕХ supplies каждого ордера ──
+    # Раньше брали только supplies[0] — пропускали остальные bundle_id и SKU!
+    seen_bundles: set = set()
+    for order in unique_orders:
+        for supply in order.get("supplies", []):
+            bid = supply.get("bundle_id")
+            if bid:
+                seen_bundles.add(bid)
+
+    logger.info(f"Уникальных bundle_id: {len(seen_bundles)}")
 
     # ── Шаг 2: получаем SKU-состав для каждого bundle ─────────────────────────
-    # bundle_id → [{sku, name, quantity}, ...]
-    bundle_to_items: dict = {}
+    bundle_to_items: dict = {}  # bundle_id → [{sku, name, quantity}, ...]
 
     async with aiohttp.ClientSession() as session:
         for bid in seen_bundles:
@@ -290,15 +293,18 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
                 bundle_data = await get_bundle_items_fast(session, bid)
                 items = bundle_data.get("items") or []
                 bundle_to_items[bid] = items
-                logger.info(f"Bundle {str(bid)[:12]}: {len(items)} items")
+                logger.info(f"Bundle {str(bid)[:12]}: {len(items)} items → SKU: {[str(i.get('sku') or i.get('product_id','?')) for i in items]}")
             except Exception as e:
                 logger.warning(f"Bundle error {str(bid)[:12]}: {e}")
                 bundle_to_items[bid] = []
 
-    # ── Шаг 3: по всем заявкам строим sku_map ─────────────────────────────────
+    # ── Шаг 3: по всем уникальным заявкам строим sku_map ─────────────────────
+    # Ключевые исправления:
+    # - итерируем ВСЕ supplies (не только supplies[0])
+    # - дедупликация по (order_number, sku) — один ордер не добавляется дважды
     sku_map: dict = {}
 
-    for order in all_orders:
+    for order in unique_orders:
         onum = order.get("order_number", "?")
         raw_state = order.get("state", "")
         state_name = STATE_NAMES.get(raw_state, raw_state)
@@ -309,46 +315,53 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
         except Exception:
             ship_dt = datetime.max.replace(tzinfo=MOSCOW_TZ)
 
-        supplies = order.get("supplies", [])
-        if not supplies:
-            continue
-        bundle_id = supplies[0].get("bundle_id")
-        if not bundle_id:
-            continue
+        # Множество SKU уже добавленных для данного ордера (чтобы не дублировать)
+        added_skus_this_order: set = set()
 
-        items = bundle_to_items.get(bundle_id, [])
-        if not items:
-            continue
-
-        for item in items:                          # ← исправленный отступ
-            sku = str(item.get("sku") or item.get("product_id") or "")
-            if not sku:
+        for supply in order.get("supplies", []):
+            bundle_id = supply.get("bundle_id")
+            if not bundle_id:
                 continue
-            name = item.get("name") or "—"
-            qty = item.get("quantity") or 0
 
-            if sku not in sku_map:
-                sku_map[sku] = {"name": name, "orders": []}
+            items = bundle_to_items.get(bundle_id, [])
+            for item in items:
+                sku = str(item.get("sku") or item.get("product_id") or "")
+                if not sku or sku in added_skus_this_order:
+                    continue  # пропускаем пустые и дублирующиеся SKU
+                added_skus_this_order.add(sku)
 
-            sku_map[sku]["orders"].append({
-                "order_number": onum,
-                "ship_dt": ship_dt,
-                "date_str": ship_dt.strftime("%d.%m.%Y %H:%M"),
-                "qty": qty,
-                "state": state_name,
-                "raw_state": raw_state,             # ← теперь сохраняется
-            })
+                name = item.get("name") or "—"
+                qty = item.get("quantity") or 0
+
+                if sku not in sku_map:
+                    sku_map[sku] = {"name": name, "orders": []}
+
+                sku_map[sku]["orders"].append({
+                    "order_number": onum,
+                    "ship_dt": ship_dt,
+                    "date_str": ship_dt.strftime("%d.%m.%Y %H:%M"),
+                    "qty": qty,
+                    "state": state_name,
+                    "raw_state": raw_state,
+                })
 
     # ── Шаг 4: для каждого SKU — фильтр DATA_FILLING → сортировка → 5 шт. ────
     for sku in sku_map:
         all_sku_orders = sku_map[sku]["orders"]
-        df_orders = [o for o in all_sku_orders if o.get("raw_state") == "DATA_FILLING"]
+        # Дедупликация order_number (на случай одинаковых номеров)
+        seen_nums: set = set()
+        dedup_sku_orders = []
+        for o in all_sku_orders:
+            if o["order_number"] not in seen_nums:
+                seen_nums.add(o["order_number"])
+                dedup_sku_orders.append(o)
+        df_orders = [o for o in dedup_sku_orders if o.get("raw_state") == "DATA_FILLING"]
         df_orders.sort(key=lambda x: x["ship_dt"])
-        sku_map[sku]["all_count"] = len(all_sku_orders)
+        sku_map[sku]["all_count"] = len(dedup_sku_orders)
         sku_map[sku]["orders"] = df_orders[:5]
         sku_map[sku]["total_qty"] = sum(o["qty"] for o in sku_map[sku]["orders"])
 
-    logger.info(f"SKU map итого: {len(sku_map)} SKU")
+    logger.info(f"SKU map итого: {len(sku_map)} SKU: {list(sku_map.keys())}")
     cluster["sku_map"] = sku_map
     return sku_map
 
