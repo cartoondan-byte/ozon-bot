@@ -86,21 +86,28 @@ async def fetch_bundle(session, bundle_id: str) -> tuple[str, list]:
 
 async def get_all_active_orders(session):
     """
-    Загрузить ВСЕ активные заявки без хардкода лимита.
+    Загружаем ТОЛЬКО заявки со статусом DATA_FILLING («Заполнение данных»)
+    с таймслотом от сегодня вперёд.
 
-    Стратегия: сортировка убывающая (новые первыми).
-    Грузим страницы батчами по 5 страниц (500 ID), сразу получаем детали
-    и проверяем сколько активных. Останавливаемся когда 3 батча подряд
-    не принесли ни одной новой активной заявки — значит добрались до
-    исторических завершённых заявок.
+    Почему так:
+    - Ozon хранит ВСЕ исторические DATA_FILLING заявки бесконечно
+      (фильтр по статусу возвращает 200k+ записей).
+    - Нам нужны только те, у которых дата поставки >= сегодня.
+    - Сортируем убывающе (новые ID первыми) — у свежих заявок таймслот
+      всегда в будущем, у старых — в прошлом.
+    - Останавливаемся когда 3 батча подряд дали 0 заявок с будущей датой
+      — значит дошли до архивных записей.
     """
-    active_states = {"DATA_FILLING", "READY_TO_SUPPLY", "ACCEPTED", "IN_TRANSIT"}
-    all_active = []
+    now = datetime.now(MOSCOW_TZ)
+    date_from = now - timedelta(days=1)    # с вчера (небольшой запас)
+    date_to   = now + timedelta(days=365)  # до года вперёд
+
+    all_orders = []
     last_id = 0
     page = 0
-    empty_batches = 0        # счётчик батчей без активных заявок
-    MAX_EMPTY_BATCHES = 3    # останавливаемся после 3 пустых батчей подряд
-    PAGES_PER_BATCH = 5      # страниц за один цикл (500 ID)
+    empty_batches = 0
+    MAX_EMPTY_BATCHES = 3
+    PAGES_PER_BATCH = 5
 
     while True:
         # ── Собираем 500 ID (5 страниц по 100) ────────────────────────────────
@@ -125,40 +132,57 @@ async def get_all_active_orders(session):
         if not batch_ids:
             break
 
-        # ── Параллельно получаем детали для этих 500 ID ───────────────────────
+        # ── Параллельно получаем детали ────────────────────────────────────────
         sub_batches = [batch_ids[i:i + 50] for i in range(0, len(batch_ids), 50)]
         tasks = [fetch_order_batch(session, b) for b in sub_batches]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        new_active = 0
+        new_found = 0
         for r in results:
-            if isinstance(r, list):
-                for order in r:
-                    if order.get("state", "") in active_states:
-                        all_active.append(order)
-                        new_active += 1
+            if not isinstance(r, list):
+                continue
+            for order in r:
+                # Только DATA_FILLING
+                if order.get("state") != "DATA_FILLING":
+                    continue
+                # Только будущие таймслоты
+                try:
+                    from_str = order["timeslot"]["timeslot"]["from"]
+                    ship_dt = datetime.fromisoformat(
+                        from_str.replace("Z", "+00:00")
+                    ).astimezone(MOSCOW_TZ)
+                    if not (date_from <= ship_dt <= date_to):
+                        continue
+                except Exception:
+                    continue
+                all_orders.append(order)
+                new_found += 1
 
-        logger.info(f"Страница {page}: +{new_active} активных (всего {len(all_active)})")
+        logger.info(f"Страница {page}: +{new_found} DATA_FILLING (всего {len(all_orders)})")
 
-        if new_active == 0:
+        if new_found == 0:
             empty_batches += 1
             if empty_batches >= MAX_EMPTY_BATCHES:
-                logger.info(f"Остановка: {MAX_EMPTY_BATCHES} батча подряд без активных заявок")
+                logger.info(f"Стоп: {MAX_EMPTY_BATCHES} батча без актуальных заявок")
                 break
         else:
-            empty_batches = 0  # сбрасываем счётчик если нашли активные
+            empty_batches = 0
 
-        # Если последняя страница была неполной — больше нет данных
         if len(batch_ids) < PAGES_PER_BATCH * 100:
             break
 
-    logger.info(f"Итого активных заявок: {len(all_active)}")
-    return all_active
+    logger.info(f"Итого DATA_FILLING заявок: {len(all_orders)}")
+    return all_orders
+
+
+async def get_all_active_orders_all_states(session):
+    """То же самое но без фильтра по статусу — для отладки."""
+    return await get_all_active_orders(session)
 
 
 async def get_data_filling_orders(session):
-    orders = await get_all_active_orders(session)
-    return [o for o in orders if o.get("state") == "DATA_FILLING"]
+    # get_all_active_orders уже возвращает только DATA_FILLING
+    return await get_all_active_orders(session)
 
 
 async def get_cluster_names(session):
