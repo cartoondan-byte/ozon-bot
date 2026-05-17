@@ -25,11 +25,9 @@ HEADERS = {
     "Content-Type": "application/json",
 }
 
-# Кэш кластеров (user_id -> {idx -> {name, orders}})
+# Кэш кластеров (user_id -> список кластеров)
 cluster_cache: dict = {}
 
-# Семафор для параллельных запросов (не более 5 одновременно)
-_semaphore = asyncio.Semaphore(5)
 
 # ===== OZON API =====
 
@@ -70,16 +68,15 @@ async def get_all_active_orders(session, max_orders=2000):
             break
         all_ids.extend(page_ids)
         if len(page_ids) < 100:
-            break  # последняя страница
+            break
         last_id = page_ids[-1]
 
     if not all_ids:
         return []
 
-    # Получаем детали батчами по 100
     all_orders = []
     for i in range(0, len(all_ids), 50):
-        batch = all_ids[i:i+50]
+        batch = all_ids[i:i + 50]
         details = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
             "order_ids": batch
         })
@@ -100,8 +97,7 @@ async def get_data_filling_orders(session):
 async def get_cluster_names(session):
     """
     Получить маппинг macrolocal_cluster_id → название кластера.
-    Структура ответа: clusters[].macrolocal_cluster_id + clusters[].name
-    Пример: {4039: "Москва, МО и Дальние регионы", 4071: "Ростов", ...}
+    Пример: {"4039": "Москва, МО и Дальние регионы", "4071": "Ростов", ...}
     """
     try:
         data = await ozon_post(session, f"{OZON_API_URL}/v1/cluster/list", {
@@ -120,22 +116,8 @@ async def get_cluster_names(session):
         return {}
 
 
-async def get_bundle_items(session, bundle_id):
-    """Получить SKU и товары из bundle заявки"""
-    try:
-        data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle", {
-            "bundle_ids": [bundle_id],
-            "limit": 100,
-            "last_id": ""
-        })
-        return data
-    except Exception as e:
-        logger.warning(f"Bundle error: {e}")
-        return {}
-
-
 async def get_bundle_items_fast(session, bundle_id):
-    """Быстрый вариант без лишнего логирования (для параллельной загрузки)"""
+    """Получить SKU и товары из bundle заявки"""
     try:
         data = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle", {
             "bundle_ids": [bundle_id],
@@ -144,12 +126,11 @@ async def get_bundle_items_fast(session, bundle_id):
         }, delay=0.3)
         return data
     except Exception as e:
-        logger.warning(f"Bundle error {bundle_id[:8]}: {e}")
+        logger.warning(f"Bundle error {str(bundle_id)[:8]}: {e}")
         return {}
 
 
 async def update_timeslot(session, supply_order_id, time_from, time_to):
-    # delay=2 — пауза для write-операций, чтобы не превысить rate limit
     return await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/timeslot/update", {
         "supply_order_id": supply_order_id,
         "timeslot": {"from": time_from, "to": time_to}
@@ -170,14 +151,13 @@ def get_current_order_date(order):
 async def process_reschedule() -> str:
     results, errors = [], []
     today = datetime.now(MOSCOW_TZ).date()
-    deadline = today + timedelta(days=3)  # отбираем заявки с датой до сегодня+3
+    deadline = today + timedelta(days=3)
 
     async with aiohttp.ClientSession() as session:
         orders = await get_data_filling_orders(session)
         if not orders:
             return "📭 Нет заявок со статусом «Заполнение данных»."
 
-        # Фильтруем: только заявки с датой отгрузки от сегодня до +3 дней
         near_orders = [
             o for o in orders
             if (d := get_current_order_date(o)) is not None and today <= d <= deadline
@@ -197,17 +177,12 @@ async def process_reschedule() -> str:
             onum = order.get("order_number", str(oid))
             try:
                 current_date = get_current_order_date(order)
-
-                # Случайное смещение +10..+28 дней от СЕГОДНЯ
                 random_days = random.randint(10, 28)
                 target_date = today + timedelta(days=random_days)
-
                 time_from = f"{target_date.strftime('%Y-%m-%d')}T16:00:00Z"
-                time_to   = f"{target_date.strftime('%Y-%m-%d')}T17:00:00Z"
-
+                time_to = f"{target_date.strftime('%Y-%m-%d')}T17:00:00Z"
                 result = await update_timeslot(session, oid, time_from, time_to)
                 logger.info(f"Update {onum}: {result}")
-
                 if not result.get("errors"):
                     cd = current_date.strftime('%d.%m') if current_date else '?'
                     results.append(f"✅ {onum}: {cd} → {target_date.strftime('%d.%m')} (+{random_days}д от сегодня)")
@@ -248,7 +223,6 @@ async def load_clusters(user_id: int):
 
     clusters = {}
     for order in orders:
-        # Берём macrolocal_cluster_id из supplies
         supplies = order.get("supplies", [])
         cluster_id = None
         if supplies:
@@ -260,116 +234,166 @@ async def load_clusters(user_id: int):
             clusters[cluster_id] = []
         clusters[cluster_id].append(order)
 
-    # Сохраняем в кэш как список для индексации
     cluster_list = []
     for cid, corders in clusters.items():
-        cluster_list.append({"id": cid, "orders": corders, "names": cluster_names})
+        cluster_list.append({
+            "id": cid,
+            "orders": corders,
+            "names": cluster_names,
+            "sku_map": None,  # заполнится при первом открытии
+        })
 
     cluster_cache[user_id] = cluster_list
     return cluster_list
 
 
 async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
-    """Загрузить SKU для кластера. {sku: {name, total_qty, orders: [{...}]}}"""
+    """
+    Загрузить SKU для кластера.
+    Возвращает {sku: {name, all_count, orders: [5 ближайших DATA_FILLING]}}
+
+    ИСПРАВЛЕНИЯ:
+    - Сначала собираем bundle→SKU маппинг (уникальные bundle_id)
+    - Затем проходим по ВСЕМ заявкам и группируем по SKU
+    - raw_state сохраняется в каждую заявку для корректной фильтрации
+    """
     cluster_list = cluster_cache.get(user_id)
     if not cluster_list or cluster_idx >= len(cluster_list):
         return {}
 
     cluster = cluster_list[cluster_idx]
-    all_orders = cluster["orders"]  # все активные
-    sku_map = {}
 
-    # Дедупликация по bundle_id (для получения списка уникальных SKU)
+    # Если уже загружено — возвращаем кэш
+    if cluster.get("sku_map") is not None:
+        return cluster["sku_map"]
+
+    all_orders = cluster["orders"]
+
+    # ── Шаг 1: собираем уникальные bundle_id ──────────────────────────────────
     seen_bundles = {}
     for order in all_orders:
         supplies = order.get("supplies", [])
         if supplies:
             bid = supplies[0].get("bundle_id")
             if bid and bid not in seen_bundles:
-                seen_bundles[bid] = order
-    unique_orders = list(seen_bundles.values())
-    logger.info(f"Всего заявок: {len(all_orders)}, уникальных bundle: {len(unique_orders)}")
+                seen_bundles[bid] = True
+
+    logger.info(f"Всего заявок: {len(all_orders)}, уникальных bundle: {len(seen_bundles)}")
+
+    # ── Шаг 2: получаем SKU-состав для каждого bundle ─────────────────────────
+    # bundle_id → [{sku, name, quantity}, ...]
+    bundle_to_items: dict = {}
 
     async with aiohttp.ClientSession() as session:
-        # Последовательно — rate limit не позволяет параллельные bundle запросы
-        for order in unique_orders:
-            onum = order.get("order_number", "?")
-            raw_state = order.get("state", "")
-            state_name = STATE_NAMES.get(raw_state, raw_state)
+        for bid in seen_bundles:
             try:
-                from_str = order["timeslot"]["timeslot"]["from"]
-                ship_dt = datetime.fromisoformat(from_str.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
-            except Exception:
-                ship_dt = datetime.max.replace(tzinfo=MOSCOW_TZ)
-
-            supplies = order.get("supplies", [])
-            bundle_id = supplies[0].get("bundle_id") if supplies else None
-            if not bundle_id:
-                continue
-
-            try:
-                bundle_data = await get_bundle_items_fast(session, bundle_id)
+                bundle_data = await get_bundle_items_fast(session, bid)
                 items = bundle_data.get("items") or []
-                logger.info(f"Bundle {onum}: {len(items)} items, state={raw_state}")
+                bundle_to_items[bid] = items
+                logger.info(f"Bundle {str(bid)[:12]}: {len(items)} items")
             except Exception as e:
-                logger.warning(f"Bundle error {onum}: {e}")
-                continue
-        for item in items:
+                logger.warning(f"Bundle error {str(bid)[:12]}: {e}")
+                bundle_to_items[bid] = []
+
+    # ── Шаг 3: по всем заявкам строим sku_map ─────────────────────────────────
+    sku_map: dict = {}
+
+    for order in all_orders:
+        onum = order.get("order_number", "?")
+        raw_state = order.get("state", "")
+        state_name = STATE_NAMES.get(raw_state, raw_state)
+
+        try:
+            from_str = order["timeslot"]["timeslot"]["from"]
+            ship_dt = datetime.fromisoformat(from_str.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
+        except Exception:
+            ship_dt = datetime.max.replace(tzinfo=MOSCOW_TZ)
+
+        supplies = order.get("supplies", [])
+        if not supplies:
+            continue
+        bundle_id = supplies[0].get("bundle_id")
+        if not bundle_id:
+            continue
+
+        items = bundle_to_items.get(bundle_id, [])
+        if not items:
+            continue
+
+        for item in items:                          # ← исправленный отступ
             sku = str(item.get("sku") or item.get("product_id") or "")
             if not sku:
                 continue
             name = item.get("name") or "—"
             qty = item.get("quantity") or 0
+
             if sku not in sku_map:
                 sku_map[sku] = {"name": name, "orders": []}
+
             sku_map[sku]["orders"].append({
                 "order_number": onum,
-                "ship_dt": ship_dt,        # datetime для сортировки
+                "ship_dt": ship_dt,
                 "date_str": ship_dt.strftime("%d.%m.%Y %H:%M"),
                 "qty": qty,
                 "state": state_name,
+                "raw_state": raw_state,             # ← теперь сохраняется
             })
 
-    # Для каждого SKU: все заявки → фильтр DATA_FILLING → сортировка → 5 ближайших
+    # ── Шаг 4: для каждого SKU — фильтр DATA_FILLING → сортировка → 5 шт. ────
     for sku in sku_map:
         all_sku_orders = sku_map[sku]["orders"]
         df_orders = [o for o in all_sku_orders if o.get("raw_state") == "DATA_FILLING"]
         df_orders.sort(key=lambda x: x["ship_dt"])
+        sku_map[sku]["all_count"] = len(all_sku_orders)
         sku_map[sku]["orders"] = df_orders[:5]
         sku_map[sku]["total_qty"] = sum(o["qty"] for o in sku_map[sku]["orders"])
-        sku_map[sku]["all_count"] = len(all_sku_orders)  # всего заявок по SKU
 
-    logger.info(f"SKU map: {list(sku_map.keys())}")
-    cluster_list[cluster_idx]["sku_map"] = sku_map
+    logger.info(f"SKU map итого: {len(sku_map)} SKU")
+    cluster["sku_map"] = sku_map
     return sku_map
 
 
-def format_sku_detail(cluster_name: str, sku: str, sku_map: dict) -> str:
-    """Форматируем детали по конкретному SKU (5 ближайших заявок)"""
-    info = sku_map.get(sku, {})
-    product_name = info.get("name", "—")
-    orders = info.get("orders", [])
-    total_qty = info.get("total_qty", 0)
+def format_cluster_full(cluster_name: str, sku_map: dict) -> list[str]:
+    """
+    Формируем текст со ВСЕМИ SKU и их 5 ближайшими заявками DATA_FILLING.
+    Возвращает список частей (разбивка по ~3800 символов для лимита Telegram).
 
-    all_count = info.get("all_count", len(orders))
-    lines = [
-        f"📍 {cluster_name}",
-        f"🏷 {product_name}",
-        f"SKU: {sku}",
-        f"Всего заявок: {all_count} | Показаны 5 ближайших DATA_FILLING: {total_qty} шт.",
-        "",
-    ]
-    for o in orders:
-        lines.append(f"📋 {o['order_number']} | {o['state']}")
-        lines.append(f"   📅 {o['date_str']} | {o['qty']} шт.")
-        lines.append("")
+    Формат:
+        📍 Дальний Восток
 
-    return "\n".join(lines)
+        🏷 Конфеты ручной работы...
+        SKU: 3929049757
+        📋 2000052613393 | 🟡 Заполнение данных
+        📅 29.05.2026 19:00 | 7 шт.
+        ...
+    """
+    parts = []
+    current = f"📍 {cluster_name}\n\n"
 
+    for sku, info in sku_map.items():
+        product_name = info.get("name", "—")
+        orders = info.get("orders", [])
 
-async def get_cluster_details(user_id: int, cluster_idx: int) -> str:
-    """Заглушка — теперь не используется напрямую"""
-    return ""
+        block = f"🏷 {product_name}\nSKU: {sku}\n"
+        if orders:
+            for o in orders:
+                block += f"📋 {o['order_number']} | {o['state']}\n"
+                block += f"📅 {o['date_str']} | {o['qty']} шт.\n"
+        else:
+            block += "ℹ️ Нет заявок «Заполнение данных»\n"
+        block += "\n"
+
+        # Если добавление блока превысит лимит — сохраняем часть и начинаем новую
+        if len(current) + len(block) > 3800:
+            parts.append(current.rstrip())
+            current = f"📍 {cluster_name} (продолжение)\n\n"
+
+        current += block
+
+    if current.strip():
+        parts.append(current.rstrip())
+
+    return parts if parts else [f"📍 {cluster_name}\n\nℹ️ Нет данных по SKU."]
 
 
 # ===== TELEGRAM =====
@@ -380,7 +404,7 @@ dp = Dispatcher()
 
 def main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Перенести заявки на день вперёд", callback_data="reschedule")],
+        [InlineKeyboardButton(text="📅 Перенести заявки", callback_data="reschedule")],
         [InlineKeyboardButton(text="🔍 Поиск по кластерам и SKU", callback_data="clusters")],
     ])
 
@@ -394,7 +418,7 @@ def again_keyboard():
 
 def back_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ К списку кластеров", callback_data="clusters")],
+        [InlineKeyboardButton(text="◀️ К кластерам", callback_data="clusters")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")],
     ])
 
@@ -445,7 +469,6 @@ async def on_clusters(callback: CallbackQuery):
             )
             return
 
-        # Строим клавиатуру с кластерами
         buttons = []
         for i, cluster in enumerate(cluster_list):
             cid = cluster["id"]
@@ -471,23 +494,29 @@ async def on_clusters(callback: CallbackQuery):
 async def on_cluster_detail(callback: CallbackQuery):
     await callback.answer()
     idx = int(callback.data.split(":")[1])
+
     try:
         await callback.message.edit_text("⏳ Загружаю SKU кластера...")
     except Exception:
         pass
+
     try:
         uid = callback.from_user.id
         cluster_list = cluster_cache.get(uid, [])
         if not cluster_list or idx >= len(cluster_list):
-            await callback.message.edit_text("❗ Данные устарели, нажми кнопку кластеров снова.")
+            await callback.message.edit_text(
+                "❗ Данные устарели, нажми кнопку кластеров снова.",
+                reply_markup=back_keyboard()
+            )
             return
 
         cluster = cluster_list[idx]
-        cluster_id = cluster["id"]
+        cid = cluster["id"]
         names = cluster.get("names", {})
-        cluster_display = names.get(str(cluster_id), f"Кластер {cluster_id}")
+        cluster_display = names.get(str(cid), f"Кластер {cid}")
 
         sku_map = await load_cluster_skus(uid, idx)
+
         if not sku_map:
             await callback.message.edit_text(
                 f"📍 {cluster_display}\n\nℹ️ Нет SKU в заявках этого кластера.",
@@ -495,68 +524,27 @@ async def on_cluster_detail(callback: CallbackQuery):
             )
             return
 
-        # Строим кнопки по SKU
-        buttons = []
-        for sku, info in sku_map.items():
-            name = info["name"]
-            total_qty = sum(o["qty"] for o in info["orders"])
-            # Укорачиваем название для кнопки
-            short_name = name[:30] + "..." if len(name) > 30 else name
-            buttons.append([InlineKeyboardButton(
-                text=f"{short_name} | {total_qty} шт.",
-                callback_data=f"sku:{idx}:{sku}"
-            )])
-        buttons.append([InlineKeyboardButton(text="◀️ К кластерам", callback_data="clusters")])
-        buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")])
+        # Формируем текстовые части (разбивка для лимита Telegram)
+        text_parts = format_cluster_full(cluster_display, sku_map)
 
-        order_count = len(cluster["orders"])
+        # Первая часть редактирует текущее сообщение
         await callback.message.edit_text(
-            f"📍 {cluster_display}\n"
-            f"Заявок: {order_count} | SKU: {len(sku_map)}\n\n"
-            f"Выбери SKU для просмотра заявок:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+            text_parts[0],
+            reply_markup=back_keyboard() if len(text_parts) == 1 else None
         )
+
+        # Дополнительные части отправляются новыми сообщениями
+        for i, part in enumerate(text_parts[1:], start=1):
+            is_last = (i == len(text_parts) - 1)
+            await callback.message.answer(
+                part,
+                reply_markup=back_keyboard() if is_last else None
+            )
+
     except Exception as e:
         logger.exception("cluster detail error")
         try:
             await callback.message.edit_text(f"❗ Ошибка: {str(e)}", reply_markup=back_keyboard())
-        except Exception:
-            pass
-
-
-@dp.callback_query(F.data.startswith("sku:"))
-async def on_sku_detail(callback: CallbackQuery):
-    await callback.answer()
-    parts = callback.data.split(":")
-    cluster_idx = int(parts[1])
-    sku = parts[2]
-
-    try:
-        uid = callback.from_user.id
-        cluster_list = cluster_cache.get(uid, [])
-        if not cluster_list or cluster_idx >= len(cluster_list):
-            await callback.message.edit_text("❗ Данные устарели.")
-            return
-
-        cluster = cluster_list[cluster_idx]
-        cluster_id = cluster["id"]
-        names = cluster.get("names", {})
-        cluster_display = names.get(str(cluster_id), f"Кластер {cluster_id}")
-        sku_map = cluster.get("sku_map", {})
-
-        text = format_sku_detail(cluster_display, sku, sku_map)
-        if len(text) > 4000:
-            text = text[:4000] + "\n...(обрезано)"
-
-        back_to_cluster = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="◀️ К SKU кластера", callback_data=f"cluster:{cluster_idx}")],
-            [InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")],
-        ])
-        await callback.message.edit_text(text, reply_markup=back_to_cluster)
-    except Exception as e:
-        logger.exception("sku detail error")
-        try:
-            await callback.message.edit_text(f"❗ Ошибка: {str(e)}")
         except Exception:
             pass
 
