@@ -68,11 +68,23 @@ async def get_all_active_orders(session, max_orders=10000):
 
 
 async def get_data_filling_orders_fast(session, max_orders=10000):
-    """Получить только DATA_FILLING заявки — фильтр state=1 на стороне API."""
-    return await _fetch_orders_by_states(session, states=[1], max_orders=max_orders)
+    """
+    Получить DATA_FILLING заявки: новые (DESC) + старые (ASC) для захвата всех bundle.
+    """
+    new_orders = await _fetch_orders_by_states(session, states=[1], max_orders=max_orders, sort_direction=2)
+    old_orders = await _fetch_orders_by_states(session, states=[1], max_orders=2000, sort_direction=1)
+    seen = set()
+    result = []
+    for o in new_orders + old_orders:
+        oid = o.get("order_id")
+        if oid not in seen:
+            seen.add(oid)
+            result.append(o)
+    logger.info(f"DATA_FILLING total: {len(result)} (новых DESC: {len(new_orders)}, старых ASC: {len(old_orders)})")
+    return result
 
 
-async def _fetch_orders_by_states(session, states: list, max_orders=10000):
+async def _fetch_orders_by_states(session, states: list, max_orders=10000, sort_direction=1):
     """Базовая функция: получить заявки с заданными статусами."""
     all_ids = []
     last_id = 0
@@ -81,7 +93,7 @@ async def _fetch_orders_by_states(session, states: list, max_orders=10000):
             "limit": 100,
             "from_supply_order_id": last_id,
             "sort_by": 1,
-            "sort_direction": 1,
+            "sort_direction": sort_direction,
             "filter": {"states": states}
         })
         page_ids = data.get("order_ids", [])
