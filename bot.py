@@ -50,8 +50,8 @@ async def ozon_post(session, url, payload, retry=3, delay=0.5):
     raise Exception("Превышен лимит запросов, попробуй позже")
 
 
-async def get_all_active_orders(session, max_orders=2000):
-    """Получить все активные заявки с пагинацией (до max_orders штук)"""
+async def get_all_active_orders(session, max_orders=100000):
+    """Получить все активные заявки с пагинацией (все штуки)"""
     all_ids = []
     last_id = 0
 
@@ -74,6 +74,7 @@ async def get_all_active_orders(session, max_orders=2000):
     if not all_ids:
         return []
 
+    logger.info(f"Всего ID в очереди: {len(all_ids)} — загружаем детали батчами по 50...")
     all_orders = []
     for i in range(0, len(all_ids), 50):
         batch = all_ids[i:i + 50]
