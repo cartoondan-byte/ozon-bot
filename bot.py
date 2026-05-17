@@ -75,7 +75,7 @@ async def get_all_active_orders(session, max_orders=10000):
     return await _fetch_orders_by_states(session, states=[1,2,3,4,5,6,7,8,9,10], max_orders=max_orders)
 
 
-async def get_data_filling_orders_fast(session, max_orders=2500):
+async def get_data_filling_orders_fast(session, max_orders=5000):
     """Получить DATA_FILLING заявки — один проход DESC (новые сначала)."""
     orders = await _fetch_orders_by_states(session, states=[1], max_orders=max_orders, sort_direction=2)
     logger.info(f"DATA_FILLING получено: {len(orders)}")
