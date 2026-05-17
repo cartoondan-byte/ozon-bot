@@ -83,56 +83,75 @@ async def fetch_bundle(session, bundle_id: str) -> tuple[str, list]:
             return bundle_id, []
 
 
-async def get_all_active_orders(session, max_orders=100000):
+async def get_all_active_orders(session):
     """
-    Загрузить ВСЕ активные заявки:
-    - /list: последовательно (нужен last_id предыдущей страницы)
-    - /get:  параллельно батчами по 50 (до 8 одновременно)
+    Загрузить ВСЕ активные заявки без хардкода лимита.
+
+    Стратегия: сортировка убывающая (новые первыми).
+    Грузим страницы батчами по 5 страниц (500 ID), сразу получаем детали
+    и проверяем сколько активных. Останавливаемся когда 3 батча подряд
+    не принесли ни одной новой активной заявки — значит добрались до
+    исторических завершённых заявок.
     """
-    # ── Шаг 1: собираем все ID (последовательно) ──────────────────────────────
-    all_ids = []
+    active_states = {"DATA_FILLING", "READY_TO_SUPPLY", "ACCEPTED", "IN_TRANSIT"}
+    all_active = []
     last_id = 0
     page = 0
-    while len(all_ids) < max_orders:
-        data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
-            "limit": 100,
-            "from_supply_order_id": last_id,
-            "sort_by": 1,
-            "sort_direction": 1,
-            "filter": {"states": [1, 2, 3, 4]}
-        }, delay=0.1)
-        page_ids = data.get("order_ids", [])
-        if not page_ids:
+    empty_batches = 0        # счётчик батчей без активных заявок
+    MAX_EMPTY_BATCHES = 3    # останавливаемся после 3 пустых батчей подряд
+    PAGES_PER_BATCH = 5      # страниц за один цикл (500 ID)
+
+    while True:
+        # ── Собираем 500 ID (5 страниц по 100) ────────────────────────────────
+        batch_ids = []
+        for _ in range(PAGES_PER_BATCH):
+            data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", {
+                "limit": 100,
+                "from_supply_order_id": last_id,
+                "sort_by": 1,
+                "sort_direction": 2,
+            }, delay=0.1)
+            page_ids = data.get("order_ids", [])
+            if not page_ids:
+                break
+            batch_ids.extend(page_ids)
+            page += 1
+            if len(page_ids) < 100:
+                break
+            last_id = page_ids[-1]
+
+        if not batch_ids:
             break
-        all_ids.extend(page_ids)
-        page += 1
-        if page % 10 == 0:
-            logger.info(f"Пагинация: страница {page}, собрано ID: {len(all_ids)}")
-        if len(page_ids) < 100:
-            break
-        last_id = page_ids[-1]
 
-    if not all_ids:
-        return []
+        # ── Параллельно получаем детали для этих 500 ID ───────────────────────
+        sub_batches = [batch_ids[i:i + 50] for i in range(0, len(batch_ids), 50)]
+        tasks = [fetch_order_batch(session, b) for b in sub_batches]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    logger.info(f"Всего ID: {len(all_ids)} — параллельная загрузка деталей...")
+        new_active = 0
+        for r in results:
+            if isinstance(r, list):
+                for order in r:
+                    if order.get("state", "") in active_states:
+                        all_active.append(order)
+                        new_active += 1
 
-    # ── Шаг 2: загружаем детали ПАРАЛЛЕЛЬНО батчами по 50 ─────────────────────
-    batches = [all_ids[i:i + 50] for i in range(0, len(all_ids), 50)]
-    tasks = [fetch_order_batch(session, b) for b in batches]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info(f"Страница {page}: +{new_active} активных (всего {len(all_active)})")
 
-    all_orders = []
-    for r in results:
-        if isinstance(r, Exception):
-            logger.warning(f"Batch error: {r}")
+        if new_active == 0:
+            empty_batches += 1
+            if empty_batches >= MAX_EMPTY_BATCHES:
+                logger.info(f"Остановка: {MAX_EMPTY_BATCHES} батча подряд без активных заявок")
+                break
         else:
-            all_orders.extend(r)
+            empty_batches = 0  # сбрасываем счётчик если нашли активные
 
-    skip = {"CANCELLED", "COMPLETED", "REJECTED"}
-    active = [o for o in all_orders if o.get("state", "") not in skip]
-    logger.info(f"ID: {len(all_ids)}, получено: {len(all_orders)}, активных: {len(active)}")
-    return active
+        # Если последняя страница была неполной — больше нет данных
+        if len(batch_ids) < PAGES_PER_BATCH * 100:
+            break
+
+    logger.info(f"Итого активных заявок: {len(all_active)}")
+    return all_active
 
 
 async def get_data_filling_orders(session):
