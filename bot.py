@@ -111,7 +111,7 @@ async def get_all_active_orders(session):
                 "from_supply_order_id": last_id,
                 "sort_by": 1,
                 "sort_direction": 2,
-                "filter": {},
+                "filter": {"states": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]},
             }, delay=0.1)
             page_ids = data.get("order_ids", [])
             if not page_ids:
