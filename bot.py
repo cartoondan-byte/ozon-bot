@@ -160,28 +160,9 @@ async def get_warehouse_names(session):
             if wid and name:
                 result[wid] = name
 
-    # /v1/warehouse/fbo/list — пробуем числовые значения enum (1=crossdock, 2=direct, 3=seller)
-    for supply_type_int in [1, 2, 3]:
-        try:
-            data = await ozon_post(session, f"{OZON_API_URL}/v1/warehouse/fbo/list", {
-                "filter_by_supply_type": supply_type_int
-            })
-            before = len(result)
-            _parse(data.get("warehouses", []))
-            logger.info(f"fbo/list [type={supply_type_int}]: +{len(result)-before} складов, warehouses={[w.get('name') or w.get('warehouse_name') for w in data.get('warehouses',[])]}")
-        except Exception as e:
-            logger.warning(f"fbo/list [type={supply_type_int}] error: {e}")
-
-    # Фоллбэк: /v2/warehouse/list — общий список складов продавца
-    try:
-        data = await ozon_post(session, f"{OZON_API_URL}/v2/warehouse/list", {})
-        _parse(data.get("result", []))
-        logger.info(f"v2/warehouse/list: {len(data.get('result', []))} складов")
-    except Exception as e:
-        logger.warning(f"v2/warehouse/list error: {e}")
-
-    logger.info(f"Итого складов: {len(result)}, маппинг: {result}")
+    # Имена складов берём из заявок напрямую — API-запросы не нужны
     return result
+
 
 
 async def get_bundle_items_fast(session, bundle_id):
@@ -303,74 +284,65 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
 
 
 
-    # Группировка: новые заявки — по macrolocal_cluster_id, старые — по warehouse_id напрямую.
-    # Ключи с префиксами "cluster:" и "wh:" исключают коллизии одинаковых числовых ID.
+    # Группировка по storageClusters/storageWarehouses — данные прямо в заявке
+    # (из HTML страницы видно: storageClusters[{id, name}], storageWarehouses[{id, name}], supplyWarehouse{id, name})
     groups_map: dict = {}
 
     for order in df_orders:
+        # Кластер размещения — из storageClusters
+        storage_clusters   = order.get("storageClusters") or order.get("storage_clusters") or []
+        storage_warehouses = order.get("storageWarehouses") or order.get("storage_warehouses") or []
+        supply_warehouse   = order.get("supplyWarehouse") or order.get("supply_warehouse") or {}
+
+        # Fallback через supplies
         supplies = order.get("supplies", [])
         sup = supplies[0] if supplies else {}
 
-        cluster_id = str(sup.get("macrolocal_cluster_id") or "")
-        # drop_off_warehouse — объект в корне заявки, содержит id и name склада
-        dow = order.get("drop_off_warehouse") or {}
-        wh_id = str(
-            dow.get("warehouse_id")
-            or sup.get("warehouse_id")
-            or sup.get("storage_warehouse_id")
-            or order.get("order_tags", {}).get("seller_warehouse_id")
-            or ""
-        )
-        wh_name_raw = str(
-            dow.get("name") or dow.get("warehouse_name")
-            or sup.get("warehouse_name")
-            or order.get("destination_place_name")
-            or ""
-        )
+        sc = storage_clusters[0] if storage_clusters else {}
+        cluster_id   = str(sc.get("id") or sup.get("macrolocal_cluster_id") or sup.get("storageClusterId") or "")
+        cluster_name = sc.get("name") or cluster_names.get(cluster_id, f"Кластер {cluster_id}")
+
+        sw = storage_warehouses[0] if storage_warehouses else {}
+        wh_id   = str(sw.get("id") or sw.get("warehouse_id") or sup.get("storageWarehouseId") or "")
+        wh_name = sw.get("name") or sw.get("warehouse_name") or (f"Склад {wh_id}" if wh_id else "Не определён")
+
+        supply_wh_name = supply_warehouse.get("name") or supply_warehouse.get("warehouse_name") or ""
 
         if cluster_id:
-            # ── НОВАЯ заявка: известен кластер ──────────────────────────
             group_key = f"cluster:{cluster_id}"
             if group_key not in groups_map:
                 groups_map[group_key] = {
-                    "type":         "cluster",
-                    "id":           cluster_id,
-                    "display_name": cluster_names.get(cluster_id, f"Кластер {cluster_id}"),
-                    "orders":       [],
-                    "warehouses":   {},
+                    "type": "cluster", "id": cluster_id,
+                    "display_name": cluster_name,
+                    "orders": [], "warehouses": {},
+                    "supply_wh": supply_wh_name,
                 }
             groups_map[group_key]["orders"].append(order)
-            sub_key  = wh_id or "unknown"
-            sub_name = wh_names.get(wh_id, wh_name_raw or f"Склад {wh_id}") if wh_id else "Неизвестный склад"
+            sub_key = wh_id or "unknown"
             if sub_key not in groups_map[group_key]["warehouses"]:
-                groups_map[group_key]["warehouses"][sub_key] = {"name": sub_name, "orders": []}
+                groups_map[group_key]["warehouses"][sub_key] = {"name": wh_name, "orders": []}
             groups_map[group_key]["warehouses"][sub_key]["orders"].append(order)
 
         elif wh_id:
-            # ── СТАРАЯ заявка: кластер не указан, группируем по складу ──
-            group_key  = f"wh:{wh_id}"
-            wh_display = wh_names.get(wh_id, wh_name_raw or f"Склад {wh_id}")
+            group_key = f"wh:{wh_id}"
             if group_key not in groups_map:
                 groups_map[group_key] = {
-                    "type":         "warehouse",
-                    "id":           wh_id,
-                    "display_name": f"🏭 {wh_display}",
-                    "orders":       [],
-                    "warehouses":   {wh_id: {"name": wh_display, "orders": []}},
+                    "type": "warehouse", "id": wh_id,
+                    "display_name": f"🏭 {wh_name}",
+                    "orders": [], "warehouses": {wh_id: {"name": wh_name, "orders": []}},
+                    "supply_wh": supply_wh_name,
                 }
             groups_map[group_key]["orders"].append(order)
             groups_map[group_key]["warehouses"][wh_id]["orders"].append(order)
 
         else:
-            # ── Без привязки ─────────────────────────────────────────────
-            group_key = "wh:unknown"
+            group_key = "unknown"
             if group_key not in groups_map:
                 groups_map[group_key] = {
-                    "type":         "warehouse",
-                    "id":           "unknown",
-                    "display_name": "🏭 Склад не определён",
-                    "orders":       [],
-                    "warehouses":   {"unknown": {"name": "Не определён", "orders": []}},
+                    "type": "warehouse", "id": "unknown",
+                    "display_name": "🏭 Без привязки",
+                    "orders": [], "warehouses": {"unknown": {"name": "Не определён", "orders": []}},
+                    "supply_wh": "",
                 }
             groups_map[group_key]["orders"].append(order)
             groups_map[group_key]["warehouses"]["unknown"]["orders"].append(order)
@@ -384,9 +356,11 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
             "display_name": gdata["display_name"],
             "orders":       gdata["orders"],
             "warehouses":   gdata["warehouses"],
+            "supply_wh":    gdata.get("supply_wh", ""),
             "names":        cluster_names,
-            "wh_names":     wh_names,
+            "wh_names":     {},
         })
+
 
     # Сортируем по убыванию количества заявок
     cluster_list.sort(key=lambda x: len(x["orders"]), reverse=True)
@@ -519,18 +493,17 @@ def format_sku_detail(cluster_name: str, sku: str, sku_map: dict) -> str:
 
 def format_cluster_overview(cluster: dict) -> str:
     """Форматирует список складов внутри кластера с количеством DATA_FILLING заявок."""
+    supply_wh = cluster.get("supply_wh", "")
     lines = [
         f"📍 *{cluster['display_name']}*",
         f"Заявок «Заполнение данных»: {len(cluster['orders'])}",
-        "",
-        "🏭 *Склады:*",
     ]
+    if supply_wh:
+        lines.append(f"📦 Точка отгрузки: {supply_wh}")
+    lines += ["", "🏭 *Склады хранения:*"]
     warehouses = cluster.get("warehouses", {})
     for wid, wdata in sorted(warehouses.items(), key=lambda x: -len(x[1]["orders"])):
-        wname  = wdata["name"]
-        wcount = len(wdata["orders"])
-        lines.append(f"  • {wname} — {wcount} заявок")
-
+        lines.append(f"  • {wdata['name']} — {len(wdata['orders'])} заявок")
     return "\n".join(lines)
 
 
