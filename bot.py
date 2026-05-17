@@ -201,7 +201,7 @@ def get_current_order_date(order):
 async def process_reschedule() -> str:
     results, errors = [], []
     today = datetime.now(MOSCOW_TZ).date()
-    deadline = today + timedelta(days=3)
+    deadline = today + timedelta(days=5)
 
     async with aiohttp.ClientSession() as session:
         orders = await get_data_filling_orders(session)
