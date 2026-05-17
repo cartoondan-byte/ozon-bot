@@ -172,14 +172,14 @@ def get_current_order_date(order):
 async def process_reschedule() -> str:
     results, errors = [], []
     today = datetime.now(MOSCOW_TZ).date()
-    deadline = today + timedelta(days=3)  # отбираем заявки с датой до сегодня+3
+    deadline = today + timedelta(days=5)  # отбираем заявки с датой до сегодня+5
 
     async with aiohttp.ClientSession() as session:
         orders = await get_data_filling_orders(session)
         if not orders:
             return "📭 Нет заявок со статусом «Заполнение данных»."
 
-        # Фильтруем: только заявки с датой отгрузки от сегодня до +3 дней
+        # Фильтруем: только заявки с датой отгрузки от сегодня до +5 дней
         near_orders = [
             o for o in orders
             if (d := get_current_order_date(o)) is not None and today <= d <= deadline
