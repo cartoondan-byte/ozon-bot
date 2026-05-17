@@ -28,7 +28,7 @@ HEADERS = {
 cluster_cache: dict = {}
 
 # Семафоры для параллельных запросов
-_sem_read   = asyncio.Semaphore(8)   # параллельность для /get и /bundle
+_sem_read   = asyncio.Semaphore(3)   # параллельность для /get и /bundle
 _sem_write  = asyncio.Semaphore(1)   # строго последовательно для timeslot/update
 
 
@@ -99,7 +99,7 @@ async def get_all_active_orders(session, max_orders=100000):
             "from_supply_order_id": last_id,
             "sort_by": 1,
             "sort_direction": 1,
-            "filter": {"states": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]}
+            "filter": {"states": [1, 2, 3, 4]}
         }, delay=0.1)
         page_ids = data.get("order_ids", [])
         if not page_ids:
