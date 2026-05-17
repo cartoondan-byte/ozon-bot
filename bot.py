@@ -642,19 +642,28 @@ async def cmd_raworder(message: types.Message):
             # Показываем ключевые поля
             supplies = o.get("supplies", [])
             sup = supplies[0] if supplies else {}
+            dow = o.get("drop_off_warehouse") or {}
+            storage_wh = sup.get("storage_warehouse") or {}
             lines = [
                 f"📋 Заявка {o.get('order_number')}",
                 f"State: {o.get('state')}",
                 f"",
+                f"=== НОВЫЙ ФОРМАТ ===",
                 f"storageClusters: {o.get('storageClusters')}",
                 f"storageWarehouses: {o.get('storageWarehouses')}",
                 f"supplyWarehouse: {o.get('supplyWarehouse')}",
+                f"",
+                f"=== СТАРЫЙ ФОРМАТ ===",
+                f"drop_off_warehouse: {dow}",
+                f"storage_warehouse: {storage_wh}",
+                f"order_tags: {o.get('order_tags')}",
                 f"",
                 f"supplies[0] keys: {list(sup.keys())}",
                 f"bundle_id: {sup.get('bundle_id')}",
                 f"macrolocal_cluster_id: {sup.get('macrolocal_cluster_id')}",
                 f"storageClusterId: {sup.get('storageClusterId')}",
                 f"storageWarehouseId: {sup.get('storageWarehouseId')}",
+                f"supply_tags: {sup.get('supply_tags')}",
                 f"",
                 f"Все ключи заявки: {list(o.keys())}",
             ]
