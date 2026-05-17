@@ -369,56 +369,74 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
 
 
 
-    # Группировка по storageClusters/storageWarehouses — данные прямо в заявке
-    # (из HTML страницы видно: storageClusters[{id, name}], storageWarehouses[{id, name}], supplyWarehouse{id, name})
+    # Группировка:
+    # Новые заявки → storageClusters[0].name (кластер)
+    # Старые заявки → supplies[0].storage_warehouse.name (склад хранения)
     groups_map: dict = {}
 
     for order in df_orders:
-        # Кластер размещения — из storageClusters
-        storage_clusters   = order.get("storageClusters") or order.get("storage_clusters") or []
-        storage_warehouses = order.get("storageWarehouses") or order.get("storage_warehouses") or []
-        supply_warehouse   = order.get("supplyWarehouse") or order.get("supply_warehouse") or {}
-
-        # Fallback через supplies
         supplies = order.get("supplies", [])
         sup = supplies[0] if supplies else {}
 
+        # --- НОВЫЙ ФОРМАТ ---
+        storage_clusters   = order.get("storageClusters") or []
+        storage_warehouses = order.get("storageWarehouses") or []
+        supply_warehouse   = order.get("supplyWarehouse") or {}
+
         sc = storage_clusters[0] if storage_clusters else {}
-        cluster_id   = str(sc.get("id") or sup.get("macrolocal_cluster_id") or sup.get("storageClusterId") or "")
-        cluster_name = sc.get("name") or cluster_names.get(cluster_id, f"Кластер {cluster_id}")
+        cluster_id   = str(sc.get("id") or "")
+        cluster_name = sc.get("name") or cluster_names.get(cluster_id, "")
 
         sw = storage_warehouses[0] if storage_warehouses else {}
-        wh_id   = str(sw.get("id") or sw.get("warehouse_id") or sup.get("storageWarehouseId") or "")
-        wh_name = sw.get("name") or sw.get("warehouse_name") or (f"Склад {wh_id}" if wh_id else "Не определён")
+        wh_id_new   = str(sw.get("id") or "")
+        wh_name_new = sw.get("name") or ""
 
-        supply_wh_name = supply_warehouse.get("name") or supply_warehouse.get("warehouse_name") or ""
+        supply_wh_name = supply_warehouse.get("name") or ""
 
+        # --- СТАРЫЙ ФОРМАТ ---
+        # supplies[0].storage_warehouse содержит склад хранения
+        old_sw = sup.get("storage_warehouse") or {}
+        old_wh_id   = str(old_sw.get("warehouse_id") or "")
+        old_wh_name = old_sw.get("name") or ""
+
+        # Точка отгрузки для старых заявок — drop_off_warehouse
+        dow = order.get("drop_off_warehouse") or {}
+        if not supply_wh_name:
+            supply_wh_name = dow.get("name") or ""
+
+        # Определяем итоговый ключ группировки
         if cluster_id:
-            group_key = f"cluster:{cluster_id}"
+            # НОВАЯ заявка — группируем по кластеру
+            group_key  = f"cluster:{cluster_id}"
+            group_name = cluster_name
+            group_type = "cluster"
+            wh_id      = wh_id_new
+            wh_name    = wh_name_new
             if group_key not in groups_map:
                 groups_map[group_key] = {
-                    "type": "cluster", "id": cluster_id,
-                    "display_name": cluster_name,
+                    "type": group_type, "id": cluster_id,
+                    "display_name": group_name,
                     "orders": [], "warehouses": {},
                     "supply_wh": supply_wh_name,
                 }
             groups_map[group_key]["orders"].append(order)
             sub_key = wh_id or "unknown"
             if sub_key not in groups_map[group_key]["warehouses"]:
-                groups_map[group_key]["warehouses"][sub_key] = {"name": wh_name, "orders": []}
+                groups_map[group_key]["warehouses"][sub_key] = {"name": wh_name or sub_key, "orders": []}
             groups_map[group_key]["warehouses"][sub_key]["orders"].append(order)
 
-        elif wh_id:
-            group_key = f"wh:{wh_id}"
+        elif old_wh_id:
+            # СТАРАЯ заявка — группируем по складу хранения
+            group_key = f"wh:{old_wh_id}"
             if group_key not in groups_map:
                 groups_map[group_key] = {
-                    "type": "warehouse", "id": wh_id,
-                    "display_name": f"🏭 {wh_name}",
-                    "orders": [], "warehouses": {wh_id: {"name": wh_name, "orders": []}},
+                    "type": "warehouse", "id": old_wh_id,
+                    "display_name": old_wh_name or f"Склад {old_wh_id}",
+                    "orders": [], "warehouses": {old_wh_id: {"name": old_wh_name, "orders": []}},
                     "supply_wh": supply_wh_name,
                 }
             groups_map[group_key]["orders"].append(order)
-            groups_map[group_key]["warehouses"][wh_id]["orders"].append(order)
+            groups_map[group_key]["warehouses"][old_wh_id]["orders"].append(order)
 
         else:
             group_key = "unknown"
