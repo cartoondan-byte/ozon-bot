@@ -379,6 +379,17 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
     # Старые заявки → supplies[0].storage_warehouse.name (склад хранения)
     groups_map: dict = {}
 
+    # Диагностика первой заявки
+    if df_orders:
+        o0 = df_orders[0]
+        s0 = (o0.get("supplies") or [{}])[0]
+        logger.info(f"ДИАГНОСТИКА первой заявки: keys={list(o0.keys())}")
+        logger.info(f"ДИАГНОСТИКА storageClusters={o0.get('storageClusters')}")
+        logger.info(f"ДИАГНОСТИКА storageWarehouses={o0.get('storageWarehouses')}")
+        logger.info(f"ДИАГНОСТИКА supplies[0] keys={list(s0.keys())}")
+        logger.info(f"ДИАГНОСТИКА storage_warehouse={s0.get('storage_warehouse')}")
+        logger.info(f"ДИАГНОСТИКА macrolocal_cluster_id={s0.get('macrolocal_cluster_id')}")
+
     for order in df_orders:
         supplies = order.get("supplies", [])
         sup = supplies[0] if supplies else {}
