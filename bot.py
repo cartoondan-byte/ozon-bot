@@ -312,31 +312,24 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
         supplies = order.get("supplies", [])
         sup = supplies[0] if supplies else {}
 
-        # --- НОВЫЙ ФОРМАТ ---
-        storage_clusters   = order.get("storageClusters") or []
-        storage_warehouses = order.get("storageWarehouses") or []
-        supply_warehouse   = order.get("supplyWarehouse") or {}
+        # Кластер: macrolocal_cluster_id из supplies (работает для всех заявок)
+        cluster_id   = str(sup.get("macrolocal_cluster_id") or "")
+        cluster_name = cluster_names.get(cluster_id, f"Кластер {cluster_id}")
 
-        sc = storage_clusters[0] if storage_clusters else {}
-        cluster_id   = str(sc.get("id") or "")
-        cluster_name = sc.get("name") or cluster_names.get(cluster_id, "")
-
-        sw = storage_warehouses[0] if storage_warehouses else {}
-        wh_id_new   = str(sw.get("id") or "")
-        wh_name_new = sw.get("name") or ""
-
-        supply_wh_name = supply_warehouse.get("name") or ""
-
-        # --- СТАРЫЙ ФОРМАТ ---
-        # supplies[0].storage_warehouse содержит склад хранения
+        # Склад хранения: из supplies[0].storage_warehouse (старые заявки)
         old_sw = sup.get("storage_warehouse") or {}
         old_wh_id   = str(old_sw.get("warehouse_id") or "")
         old_wh_name = old_sw.get("name") or ""
 
-        # Точка отгрузки для старых заявок — drop_off_warehouse
+        # Точка отгрузки: drop_off_warehouse
         dow = order.get("drop_off_warehouse") or {}
-        if not supply_wh_name:
-            supply_wh_name = dow.get("name") or ""
+        supply_wh_name = dow.get("name") or ""
+
+        # Склад хранения для нового формата — из storageWarehouses если есть
+        storage_warehouses = order.get("storageWarehouses") or []
+        sw = storage_warehouses[0] if storage_warehouses else {}
+        wh_id_new   = str(sw.get("id") or old_wh_id or "")
+        wh_name_new = sw.get("name") or old_wh_name or "—"
 
         # Определяем итоговый ключ группировки
         if cluster_id:
