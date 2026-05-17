@@ -285,17 +285,6 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
 
 
 
-    # ДИАГНОСТИКА: полная структура одной заявки
-    if df_orders:
-        o = df_orders[0]
-        sup = (o.get('supplies') or [{}])[0]
-        import json as _json
-        logger.info(f"FULL_ORDER keys={list(o.keys())}")
-        logger.info(f"FULL_SUP={_json.dumps(sup, ensure_ascii=False, default=str)[:800]}")
-        # Дополнительно — заявка со старым bundle (ищем где order_number меньше)
-        old_order = min(df_orders, key=lambda x: x.get('order_id', 9e18))
-        old_sup = (old_order.get('supplies') or [{}])[0]
-        logger.info(f"OLDEST order={old_order.get('order_number')} sup={_json.dumps(old_sup, ensure_ascii=False, default=str)[:800]}")
 
     # Группировка: новые заявки — по macrolocal_cluster_id, старые — по warehouse_id напрямую.
     # Ключи с префиксами "cluster:" и "wh:" исключают коллизии одинаковых числовых ID.
@@ -306,15 +295,18 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
         sup = supplies[0] if supplies else {}
 
         cluster_id = str(sup.get("macrolocal_cluster_id") or "")
+        # drop_off_warehouse — объект в корне заявки, содержит id и name склада
+        dow = order.get("drop_off_warehouse") or {}
         wh_id = str(
-            sup.get("warehouse_id")
+            dow.get("warehouse_id")
+            or sup.get("warehouse_id")
             or sup.get("storage_warehouse_id")
             or order.get("order_tags", {}).get("seller_warehouse_id")
             or ""
         )
-        # Текстовое имя склада из самой заявки — помогает для старых заявок
         wh_name_raw = str(
-            sup.get("warehouse_name")
+            dow.get("name") or dow.get("warehouse_name")
+            or sup.get("warehouse_name")
             or order.get("destination_place_name")
             or ""
         )
@@ -402,71 +394,75 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
     wh_names  = cluster.get("wh_names", {})
     sku_map   = {}
 
-    # Дедупликация по bundle_id
-    seen_bundles = {}
+    # Дедупликация по bundle_id: один bundle = один API-запрос,
+    # но сохраняем ВСЕ заявки с этим bundle для правильного счёта заявок.
+    bundle_to_orders: dict = {}
     for order in df_orders:
         supplies = order.get("supplies", [])
-        if supplies:
-            bid = supplies[0].get("bundle_id")
-            if bid and bid not in seen_bundles:
-                seen_bundles[bid] = order
-    unique_orders = list(seen_bundles.values())
-    logger.info(f"DATA_FILLING заявок: {len(df_orders)}, уникальных bundle: {len(unique_orders)}")
+        bid = supplies[0].get("bundle_id") if supplies else None
+        if not bid:
+            continue
+        if bid not in bundle_to_orders:
+            bundle_to_orders[bid] = []
+        bundle_to_orders[bid].append(order)
+    logger.info(f"DATA_FILLING заявок: {len(df_orders)}, уникальных bundle: {len(bundle_to_orders)}")
 
     async with aiohttp.ClientSession() as session:
-        for order in unique_orders:
-            onum     = order.get("order_number", "?")
-            supplies = order.get("supplies", [])
-            bundle_id = supplies[0].get("bundle_id") if supplies else None
-
-            # Определяем склад для этой заявки
-            wh_id = ""
-            if supplies:
-                sup = supplies[0]
-                wh_id = str(
-                    sup.get("warehouse_id")
-                    or sup.get("storage_warehouse_id")
-                    or order.get("order_tags", {}).get("seller_warehouse_id")
-                    or ""
-                )
-            wh_name = wh_names.get(wh_id, f"Склад {wh_id}") if wh_id else "—"
-
-            try:
-                from_str = order["timeslot"]["timeslot"]["from"]
-                ship_dt  = datetime.fromisoformat(from_str.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
-            except Exception:
-                ship_dt = datetime.max.replace(tzinfo=MOSCOW_TZ)
-
-            if not bundle_id:
-                continue
-
+        for bundle_id, b_orders in bundle_to_orders.items():
+            # Получаем список SKU из API один раз для этого bundle
             try:
                 bundle_data = await get_bundle_items_fast(session, bundle_id)
                 items = bundle_data.get("items") or []
-                logger.info(f"Bundle {onum}: {len(items)} items")
+                logger.info(f"Bundle {bundle_id[:8]}: {len(items)} items, {len(b_orders)} заявок")
             except Exception as e:
-                logger.warning(f"Bundle error {onum}: {e}")
+                logger.warning(f"Bundle error {bundle_id[:8]}: {e}")
                 continue
 
-            # ИСПРАВЛЕН ОТСТУП: теперь for item in items внутри for order
-            for item in items:
-                sku = str(item.get("sku") or item.get("product_id") or "")
-                if not sku:
-                    continue
-                name = item.get("name") or "—"
-                qty  = item.get("quantity") or 0
+            if not items:
+                continue
 
-                if sku not in sku_map:
-                    sku_map[sku] = {"name": name, "orders": []}
+            # Добавляем запись для каждой заявки с этим bundle
+            for order in b_orders:
+                onum     = order.get("order_number", "?")
+                supplies = order.get("supplies", [])
+                dow = order.get("drop_off_warehouse") or {}
+                sup_s = supplies[0] if supplies else {}
+                wh_id = str(
+                    dow.get("warehouse_id")
+                    or sup_s.get("warehouse_id")
+                    or sup_s.get("storage_warehouse_id")
+                    or order.get("order_tags", {}).get("seller_warehouse_id")
+                    or ""
+                )
+                wh_name = (
+                    dow.get("name") or dow.get("warehouse_name")
+                    or wh_names.get(wh_id, "")
+                    or (f"Склад {wh_id}" if wh_id else "—")
+                )
+                try:
+                    from_str = order["timeslot"]["timeslot"]["from"]
+                    ship_dt  = datetime.fromisoformat(from_str.replace("Z", "+00:00")).astimezone(MOSCOW_TZ)
+                except Exception:
+                    ship_dt = datetime.max.replace(tzinfo=MOSCOW_TZ)
 
-                sku_map[sku]["orders"].append({
-                    "order_number": onum,
-                    "ship_dt":      ship_dt,
-                    "date_str":     ship_dt.strftime("%d.%m.%Y %H:%M"),
-                    "qty":          qty,
-                    "state":        STATE_NAMES.get("DATA_FILLING", "DATA_FILLING"),
-                    "wh_name":      wh_name,
-                })
+                for item in items:
+                    sku = str(item.get("sku") or item.get("product_id") or "")
+                    if not sku:
+                        continue
+                    name = item.get("name") or "—"
+                    qty  = item.get("quantity") or 0
+
+                    if sku not in sku_map:
+                        sku_map[sku] = {"name": name, "orders": []}
+
+                    sku_map[sku]["orders"].append({
+                        "order_number": onum,
+                        "ship_dt":      ship_dt,
+                        "date_str":     ship_dt.strftime("%d.%m.%Y %H:%M"),
+                        "qty":          qty,
+                        "state":        STATE_NAMES.get("DATA_FILLING", "DATA_FILLING"),
+                        "wh_name":      wh_name,
+                    })
 
     # Сортировка и агрегация
     for sku in sku_map:
