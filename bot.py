@@ -330,7 +330,7 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
             df_orders.extend(batch_orders)
             from_id = last_id
 
-            # Считаем уникальные кластеры и bundle в новой порции
+            # Считаем уникальные группы и bundle в новой порции
             for o in batch_orders:
                 supplies = o.get("supplies", [])
                 sup = supplies[0] if supplies else {}
@@ -338,8 +338,13 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
                 sc = storage_clusters[0] if storage_clusters else {}
                 cid = str(sc.get("id") or sup.get("macrolocal_cluster_id") or "")
                 bid = sup.get("bundle_id") or ""
+                # Для старых заявок считаем склад как отдельную группу
+                old_sw = sup.get("storage_warehouse") or {}
+                old_wh_id = str(old_sw.get("warehouse_id") or "")
                 if cid:
-                    seen_clusters.add(cid)
+                    seen_clusters.add(f"cluster:{cid}")
+                elif old_wh_id:
+                    seen_clusters.add(f"wh:{old_wh_id}")
                 if bid:
                     seen_bundles.add(bid)
 
@@ -358,9 +363,9 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
             last_cluster_count = len(seen_clusters)
             last_bundle_count  = len(seen_bundles)
 
-            # Если достигли всех известных кластеров (22) и bundle не растут
-            if len(seen_clusters) >= 22 and stable_rounds >= 1:
-                logger.info(f"Все кластеры найдены ({len(seen_clusters)}), останавливаемся")
+            # Если достигли 30+ групп (кластеры + склады) и bundle стабильны
+            if len(seen_clusters) >= 30 and stable_rounds >= 1:
+                logger.info(f"Достаточно групп найдено ({len(seen_clusters)}), останавливаемся")
                 break
 
     logger.info(f"DATA_FILLING итого: {len(df_orders)} заявок, {len(seen_clusters)} кластеров, {len(seen_bundles)} bundle")
@@ -467,6 +472,11 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
 
     # Сортируем по убыванию количества заявок
     cluster_list.sort(key=lambda x: len(x["orders"]), reverse=True)
+
+    # Диагностика
+    for g in cluster_list[:5]:
+        logger.info(f"Группа: type={g['type']} name={g['display_name']} orders={len(g['orders'])}")
+    logger.info(f"groups_map keys: {list(groups_map.keys())[:10]}")
 
     cluster_cache[user_id] = cluster_list
     cluster_cache_time[user_id] = datetime.now()
