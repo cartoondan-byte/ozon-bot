@@ -106,8 +106,8 @@ async def _fetch_orders_by_states(session, states: list, max_orders=10000, sort_
         return []
 
     all_orders = []
-    for i in range(0, len(all_ids), 100):
-        batch = all_ids[i:i+100]
+    for i in range(0, len(all_ids), 50):
+        batch = all_ids[i:i+50]
         details = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
             "order_ids": batch
         }, retry=5, delay=1.0)
@@ -313,8 +313,8 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
                 return [], 0
 
             orders = []
-            for i in range(0, len(ids), 100):
-                batch = ids[i:i+100]
+            for i in range(0, len(ids), 50):
+                batch = ids[i:i+50]
                 det = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
                     "order_ids": batch
                 }, retry=5, delay=1.0)
@@ -883,9 +883,9 @@ async def on_scan_skus(callback: CallbackQuery):
 
             # Получаем детали
             orders = []
-            for i in range(0, len(ids), 100):
+            for i in range(0, len(ids), 50):
                 det = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {
-                    "order_ids": ids[i:i+100]
+                    "order_ids": ids[i:i+50]
                 }, retry=5, delay=1.0)
                 orders.extend(det.get("orders", []))
             total_loaded += len(orders)
