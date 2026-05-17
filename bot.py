@@ -28,6 +28,10 @@ HEADERS = {
 
 # Кэш кластеров (user_id -> list[{id, orders, names}])
 cluster_cache: dict = {}
+# Время последней загрузки кэша (user_id -> datetime)
+cluster_cache_time: dict = {}
+# TTL кэша — 10 минут
+CACHE_TTL_SECONDS = 600
 
 STATE_NAMES = {
     "DATA_FILLING":    "🟡 Заполнение данных",
@@ -235,27 +239,22 @@ async def process_reschedule() -> str:
 
 # ===== ЛОГИКА КЛАСТЕРОВ (только DATA_FILLING) =====
 
-async def load_clusters_data_filling(user_id: int):
+async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
     """
     Загружает только заявки DATA_FILLING, группирует по кластерам и складам.
-    Структура кэша:
-      cluster_cache[user_id] = [
-        {
-          "id": "4039",
-          "display_name": "Москва, МО ...",
-          "orders": [...],          # все DATA_FILLING заявки кластера
-          "warehouses": {           # склады внутри кластера
-            "12345": {
-              "name": "Хоругвино",
-              "orders": [...]
-            }
-          },
-          "names": {...},           # общий маппинг cluster_id -> name
-          "wh_names": {...},        # общий маппинг warehouse_id -> name
-        },
-        ...
-      ]
+    Результат кэшируется на CACHE_TTL_SECONDS секунд.
+    При force_refresh=True — всегда перезагружает с API.
     """
+    # Проверяем кэш
+    if not force_refresh and user_id in cluster_cache:
+        cached_at = cluster_cache_time.get(user_id)
+        age = (datetime.now() - cached_at).total_seconds() if cached_at else CACHE_TTL_SECONDS + 1
+        if age < CACHE_TTL_SECONDS:
+            logger.info(f"Кэш актуален (возраст {int(age)}с), возвращаем без запроса к API")
+            return cluster_cache[user_id]
+        else:
+            logger.info(f"Кэш устарел ({int(age)}с > {CACHE_TTL_SECONDS}с), обновляем")
+
     async with aiohttp.ClientSession() as session:
         all_orders   = await get_all_active_orders(session)
         cluster_names = await get_cluster_names(session)
@@ -324,7 +323,8 @@ async def load_clusters_data_filling(user_id: int):
     cluster_list.sort(key=lambda x: len(x["orders"]), reverse=True)
 
     cluster_cache[user_id] = cluster_list
-    logger.info(f"Кластеров с DATA_FILLING: {len(cluster_list)}")
+    cluster_cache_time[user_id] = datetime.now()
+    logger.info(f"Кластеров с DATA_FILLING: {len(cluster_list)}, кэш обновлён")
     return cluster_list
 
 
@@ -519,50 +519,104 @@ async def on_reschedule(callback: CallbackQuery):
     await callback.message.edit_text(result, reply_markup=again_keyboard())
 
 
+def _build_clusters_screen(cluster_list: list, uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    """Формирует текст и клавиатуру экрана списка кластеров."""
+    cached_at = cluster_cache_time.get(uid)
+    if cached_at:
+        age_sec = int((datetime.now() - cached_at).total_seconds())
+        if age_sec < 60:
+            freshness = f"только что"
+        elif age_sec < 3600:
+            freshness = f"{age_sec // 60} мин. назад"
+        else:
+            freshness = f"{age_sec // 3600} ч. назад"
+        cache_note = f"🕐 Данные обновлены: {freshness}"
+    else:
+        cache_note = ""
+
+    total_df = sum(len(c["orders"]) for c in cluster_list)
+    text = (
+        f"🟡 *Заявки со статусом «Заполнение данных»*\n\n"
+        f"Всего заявок: {total_df}\n"
+        f"Кластеров: {len(cluster_list)}\n"
+        f"{cache_note}\n\n"
+        f"Выбери кластер для просмотра складов и SKU:"
+    )
+
+    buttons = []
+    for i, cluster in enumerate(cluster_list):
+        count    = len(cluster["orders"])
+        wh_count = len(cluster["warehouses"])
+        buttons.append([InlineKeyboardButton(
+            text=f"📍 {cluster['display_name']} | {count} заявок | {wh_count} склад(ов)",
+            callback_data=f"cluster:{i}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить данные", callback_data="clusters_refresh")])
+    buttons.append([InlineKeyboardButton(text="🏠 Главное меню",    callback_data="menu")])
+
+    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @dp.callback_query(F.data == "clusters")
 async def on_clusters(callback: CallbackQuery):
-    """
-    Главный экран поиска — показывает все кластеры,
-    в которых есть заявки со статусом DATA_FILLING.
-    """
+    """Экран кластеров — использует кэш если он свежий."""
     await callback.answer()
-    await callback.message.edit_text(
-        "⏳ Загружаю кластеры с заявками «Заполнение данных»..."
+    uid = callback.from_user.id
+
+    # Если кэш есть и свежий — показываем мгновенно без edit "Загружаю..."
+    cached_at = cluster_cache_time.get(uid)
+    has_fresh_cache = (
+        uid in cluster_cache
+        and cached_at is not None
+        and (datetime.now() - cached_at).total_seconds() < CACHE_TTL_SECONDS
     )
+
+    if not has_fresh_cache:
+        await callback.message.edit_text("⏳ Загружаю кластеры с заявками «Заполнение данных»...")
+
     try:
-        cluster_list = await load_clusters_data_filling(callback.from_user.id)
+        cluster_list = await load_clusters_data_filling(uid)
 
         if not cluster_list:
             await callback.message.edit_text(
                 "📭 Нет активных заявок со статусом «Заполнение данных».",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                    InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")
-                ]])
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Обновить данные", callback_data="clusters_refresh")],
+                    [InlineKeyboardButton(text="🏠 Главное меню",    callback_data="menu")],
+                ])
             )
             return
 
-        # Строим клавиатуру: каждый кластер — отдельная кнопка
-        buttons = []
-        for i, cluster in enumerate(cluster_list):
-            count = len(cluster["orders"])
-            wh_count = len(cluster["warehouses"])
-            buttons.append([InlineKeyboardButton(
-                text=f"📍 {cluster['display_name']} | {count} заявок | {wh_count} склад(ов)",
-                callback_data=f"cluster:{i}"
-            )])
-        buttons.append([InlineKeyboardButton(text="🏠 Главное меню", callback_data="menu")])
-
-        total_df = sum(len(c["orders"]) for c in cluster_list)
-        await callback.message.edit_text(
-            f"🟡 *Заявки со статусом «Заполнение данных»*\n\n"
-            f"Всего заявок: {total_df}\n"
-            f"Кластеров: {len(cluster_list)}\n\n"
-            f"Выбери кластер для просмотра складов и SKU:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-            parse_mode="Markdown"
-        )
+        text, kb = _build_clusters_screen(cluster_list, uid)
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
     except Exception as e:
         logger.exception("clusters error")
+        await callback.message.edit_text(f"❗ Ошибка: {str(e)}", reply_markup=main_keyboard())
+
+
+@dp.callback_query(F.data == "clusters_refresh")
+async def on_clusters_refresh(callback: CallbackQuery):
+    """Принудительное обновление кэша кластеров."""
+    await callback.answer("🔄 Обновляю данные...")
+    uid = callback.from_user.id
+    await callback.message.edit_text("⏳ Загружаю свежие данные с Ozon...")
+    try:
+        cluster_list = await load_clusters_data_filling(uid, force_refresh=True)
+
+        if not cluster_list:
+            await callback.message.edit_text(
+                "📭 Нет активных заявок со статусом «Заполнение данных».",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🔄 Обновить данные", callback_data="clusters_refresh")],
+                    [InlineKeyboardButton(text="🏠 Главное меню",    callback_data="menu")],
+                ])
+            )
+            return
+
+        text, kb = _build_clusters_screen(cluster_list, uid)
+        await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("clusters_refresh error")
         await callback.message.edit_text(f"❗ Ошибка: {str(e)}", reply_markup=main_keyboard())
 
 
