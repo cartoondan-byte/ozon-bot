@@ -263,20 +263,15 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
         return cluster["sku_map"]
 
     all_orders = cluster["orders"]
+    logger.info(f"Всего заявок в кластере: {len(all_orders)}")
 
-    # ── Шаг 0: дедупликация заявок по order_id (пагинация может давать дубли) ─
-    dedup_orders: dict = {}
-    for order in all_orders:
-        oid = order.get("order_id") or order.get("supply_order_id") or order.get("order_number")
-        if oid and oid not in dedup_orders:
-            dedup_orders[oid] = order
-    unique_orders = list(dedup_orders.values())
-    logger.info(f"Всего заявок в кластере: {len(all_orders)}, уникальных: {len(unique_orders)}")
-
-    # ── Шаг 1: собираем уникальные bundle_id из ВСЕХ supplies каждого ордера ──
-    # Раньше брали только supplies[0] — пропускали остальные bundle_id и SKU!
+    # ── Шаг 1: собираем уникальные bundle_id из ВСЕХ supplies ВСЕХ заявок ─────
+    # ВАЖНО: НЕ дедуплицируем заявки по order_id — он является родительским ID
+    # и может быть общим для многих supply orders. Ранее дедупликация по order_id
+    # сжимала 180 заявок до 9, теряя bundle_id и SKU других товаров.
+    # Дедуплицируем только bundle_id (чтобы не делать лишние запросы к API).
     seen_bundles: set = set()
-    for order in unique_orders:
+    for order in all_orders:
         for supply in order.get("supplies", []):
             bid = supply.get("bundle_id")
             if bid:
@@ -293,18 +288,18 @@ async def load_cluster_skus(user_id: int, cluster_idx: int) -> dict:
                 bundle_data = await get_bundle_items_fast(session, bid)
                 items = bundle_data.get("items") or []
                 bundle_to_items[bid] = items
-                logger.info(f"Bundle {str(bid)[:12]}: {len(items)} items → SKU: {[str(i.get('sku') or i.get('product_id','?')) for i in items]}")
+                skus = [str(i.get("sku") or i.get("product_id", "?")) for i in items]
+                logger.info(f"Bundle {str(bid)[:12]}: {len(items)} items → SKU: {skus}")
             except Exception as e:
                 logger.warning(f"Bundle error {str(bid)[:12]}: {e}")
                 bundle_to_items[bid] = []
 
-    # ── Шаг 3: по всем уникальным заявкам строим sku_map ─────────────────────
-    # Ключевые исправления:
-    # - итерируем ВСЕ supplies (не только supplies[0])
-    # - дедупликация по (order_number, sku) — один ордер не добавляется дважды
+    # ── Шаг 3: по ВСЕМ заявкам строим sku_map ────────────────────────────────
+    # - итерируем ВСЕ supplies каждого ордера (не только supplies[0])
+    # - дедупликация по (order_number, sku) внутри одного ордера
     sku_map: dict = {}
 
-    for order in unique_orders:
+    for order in all_orders:
         onum = order.get("order_number", "?")
         raw_state = order.get("state", "")
         state_name = STATE_NAMES.get(raw_state, raw_state)
