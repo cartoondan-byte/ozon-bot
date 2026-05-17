@@ -284,16 +284,18 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
 
 
 
-    # ДИАГНОСТИКА: логируем storage_warehouse у первых 3 заявок
-    for order in df_orders[:3]:
-        sup = (order.get('supplies') or [{}])[0]
-        sw = sup.get('storage_warehouse') or {}
-        logger.info(
-            f"DIAG2 order={order.get('order_number')} "
-            f"cluster_id={sup.get('macrolocal_cluster_id')!r} "
-            f"is_crossdock={sup.get('is_crossdock')!r} "
-            f"storage_warehouse={sw!r}"
-        )
+
+    # ДИАГНОСТИКА: полная структура одной заявки
+    if df_orders:
+        o = df_orders[0]
+        sup = (o.get('supplies') or [{}])[0]
+        import json as _json
+        logger.info(f"FULL_ORDER keys={list(o.keys())}")
+        logger.info(f"FULL_SUP={_json.dumps(sup, ensure_ascii=False, default=str)[:800]}")
+        # Дополнительно — заявка со старым bundle (ищем где order_number меньше)
+        old_order = min(df_orders, key=lambda x: x.get('order_id', 9e18))
+        old_sup = (old_order.get('supplies') or [{}])[0]
+        logger.info(f"OLDEST order={old_order.get('order_number')} sup={_json.dumps(old_sup, ensure_ascii=False, default=str)[:800]}")
 
     # Группировка: новые заявки — по macrolocal_cluster_id, старые — по warehouse_id напрямую.
     # Ключи с префиксами "cluster:" и "wh:" исключают коллизии одинаковых числовых ID.
