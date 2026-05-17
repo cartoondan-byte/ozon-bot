@@ -62,7 +62,7 @@ async def ozon_post(session, url, payload, retry=3, delay=0.5):
     raise Exception("Превышен лимит запросов, попробуй позже")
 
 
-async def get_all_active_orders(session, max_orders=2000):
+async def get_all_active_orders(session, max_orders=10000):
     """Получить все активные заявки с пагинацией."""
     all_ids = []
     last_id = 0
@@ -141,16 +141,17 @@ async def get_warehouse_names(session):
             if wid and name:
                 result[wid] = name
 
-    # /v1/warehouse/fbo/list требует filter_by_supply_type — пробуем оба значения
-    for supply_type in ["TYPE_CROSSDOCK", "TYPE_DIRECT"]:
+    # /v1/warehouse/fbo/list — пробуем числовые значения enum (1=crossdock, 2=direct, 3=seller)
+    for supply_type_int in [1, 2, 3]:
         try:
             data = await ozon_post(session, f"{OZON_API_URL}/v1/warehouse/fbo/list", {
-                "filter_by_supply_type": supply_type
+                "filter_by_supply_type": supply_type_int
             })
+            before = len(result)
             _parse(data.get("warehouses", []))
-            logger.info(f"fbo/list [{supply_type}]: {len(data.get('warehouses', []))} складов")
+            logger.info(f"fbo/list [type={supply_type_int}]: +{len(result)-before} складов, warehouses={[w.get('name') or w.get('warehouse_name') for w in data.get('warehouses',[])]}")
         except Exception as e:
-            logger.warning(f"fbo/list [{supply_type}] error: {e}")
+            logger.warning(f"fbo/list [type={supply_type_int}] error: {e}")
 
     # Фоллбэк: /v2/warehouse/list — общий список складов продавца
     try:
@@ -282,19 +283,16 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
     logger.info(f"DATA_FILLING заявок: {len(df_orders)} из {len(all_orders)} активных")
 
 
-    # ДИАГНОСТИКА: логируем структуру первых 5 заявок
-    for order in df_orders[:5]:
+
+    # ДИАГНОСТИКА: логируем storage_warehouse у первых 3 заявок
+    for order in df_orders[:3]:
         sup = (order.get('supplies') or [{}])[0]
+        sw = sup.get('storage_warehouse') or {}
         logger.info(
-            f"DIAG order={order.get('order_number')} "
+            f"DIAG2 order={order.get('order_number')} "
             f"cluster_id={sup.get('macrolocal_cluster_id')!r} "
-            f"warehouse_id={sup.get('warehouse_id')!r} "
-            f"storage_wh_id={sup.get('storage_warehouse_id')!r} "
-            f"wh_name={sup.get('warehouse_name')!r} "
-            f"dest={order.get('destination_place_name')!r} "
-            f"supply_type={order.get('supply_type')!r} "
-            f"order_tags={order.get('order_tags')!r} "
-            f"supply_keys={list(sup.keys())}"
+            f"is_crossdock={sup.get('is_crossdock')!r} "
+            f"storage_warehouse={sw!r}"
         )
 
     # Группировка: новые заявки — по macrolocal_cluster_id, старые — по warehouse_id напрямую.
