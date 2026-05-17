@@ -536,6 +536,59 @@ def back_keyboard():
     ])
 
 
+@dp.message(F.text.startswith("/findsku"))
+async def cmd_findsku(message: types.Message):
+    """Ищет заявки с конкретным SKU: /findsku 3479900339"""
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        await message.answer("Использование: /findsku <SKU>")
+        return
+    target_sku = parts[1].strip()
+    await message.answer(f"🔍 Ищу SKU {target_sku} в заявках... (~1 мин)")
+    
+    found = []
+    async with aiohttp.ClientSession() as session:
+        # Грузим последние 2500 заявок
+        orders = await get_data_filling_orders_fast(session)
+        # Собираем уникальные bundle
+        seen_bundles = {}
+        for o in orders:
+            supplies = o.get("supplies", [])
+            bid = supplies[0].get("bundle_id") if supplies else None
+            if bid and bid not in seen_bundles:
+                seen_bundles[bid] = o
+        
+        logger.info(f"findsku: проверяем {len(seen_bundles)} bundle на SKU {target_sku}")
+        
+        for bid, order in seen_bundles.items():
+            try:
+                bd = await get_bundle_items_fast(session, bid)
+                items = bd.get("items") or []
+                for item in items:
+                    sku = str(item.get("sku") or item.get("product_id") or "")
+                    if sku == target_sku:
+                        # Нашли! Берём кластер из заявки
+                        sc = (order.get("storageClusters") or [{}])[0]
+                        sw = (order.get("storageWarehouses") or [{}])[0]
+                        found.append(
+                            f"✅ Заявка {order.get('order_number')} | "
+                            f"Кластер: {sc.get('name','?')} | "
+                            f"Склад: {sw.get('name','?')} | "
+                            f"{item.get('name','?')[:40]}"
+                        )
+            except Exception as e:
+                pass
+    
+    if found:
+        text = f"🎯 SKU {target_sku} найден в {len(found)} bundle:\n\n" + "\n".join(found[:20])
+    else:
+        text = f"❌ SKU {target_sku} не найден в последних 2500 заявках DATA_FILLING"
+    
+    if len(text) > 4000:
+        text = text[:4000] + "\n...(обрезано)"
+    await message.answer(text)
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     await message.answer(
