@@ -20,43 +20,66 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher()
 
-# ===== МАППИНГ КЛАСТЕРОВ (загружается из API при старте) =====
+# ===== МАППИНГ КЛАСТЕРОВ =====
 CLUSTER_NAMES: dict = {}
 
 def cluster_name(cluster_id: str) -> str:
-    """Возвращает 'Кластер {название}' или 'Кластер {id}' если не найден."""
     name = CLUSTER_NAMES.get(str(cluster_id), "")
     if name:
         return f"Кластер {name}"
     return f"Кластер {cluster_id}"
 
+
 async def load_cluster_names() -> None:
-    """Загружает список кластеров из /v1/cluster/list и заполняет CLUSTER_NAMES."""
+    """Перебирает варианты cluster_type пока не найдёт рабочий."""
     global CLUSTER_NAMES
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{OZON_API_URL}/v1/cluster/list",
-                headers=ozon_headers(),
-                json={}
-            ) as resp:
-                raw  = await resp.text()
-                data = json.loads(raw)
-                logging.info(f"cluster/list → {resp.status} | {raw[:400]}")
 
-        clusters = data.get("clusters", data.get("result", []))
-        for c in clusters:
-            cid  = str(c.get("cluster_id", c.get("id", "")))
-            name = c.get("name", c.get("cluster_name", ""))
-            if cid and name:
-                CLUSTER_NAMES[cid] = name
+    for cluster_type in [
+        "CLUSTER_TYPE_SUPPLY_DELIVERY",
+        "CLUSTER_TYPE_SUPPLY",
+        "CLUSTER_TYPE_DELIVERY",
+        "SUPPLY_DELIVERY",
+        "SUPPLY",
+        "DELIVERY",
+    ]:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{OZON_API_URL}/v1/cluster/list",
+                    headers=ozon_headers(),
+                    json={"cluster_type": cluster_type}
+                ) as resp:
+                    raw  = await resp.text()
+                    logging.info(f"cluster/list type={cluster_type} → {resp.status} | {raw[:300]}")
+                    if resp.status != 200:
+                        continue
+                    data = json.loads(raw)
 
-        logging.info(f"Загружено кластеров: {len(CLUSTER_NAMES)}")
-    except Exception as e:
-        logging.warning(f"Не удалось загрузить кластеры: {e}")
+            clusters = (
+                data.get("clusters") or
+                data.get("result", {}).get("clusters") or
+                data.get("result") or []
+            )
+            if not isinstance(clusters, list):
+                clusters = []
+
+            for c in clusters:
+                cid  = str(c.get("cluster_id") or c.get("id") or c.get("macrolocal_cluster_id") or "")
+                name = c.get("name") or c.get("cluster_name") or c.get("title") or ""
+                if cid and name:
+                    CLUSTER_NAMES[cid] = name
+
+            if CLUSTER_NAMES:
+                logging.info(f"Загружено кластеров ({cluster_type}): {len(CLUSTER_NAMES)}")
+                return
+
+        except Exception as e:
+            logging.warning(f"cluster/list type={cluster_type}: {e}")
+
+    logging.warning("Кластеры не загружены — будут показаны числовые коды")
 
 
-# ===== КЭШ ДАННЫХ (чтобы не перезапрашивать при навигации) =====
+# ===== КЭШ =====
 _cache: dict = {}
 
 
@@ -69,7 +92,7 @@ def ozon_headers() -> dict:
     }
 
 
-# ===== POST-запрос с retry на 429 =====
+# ===== POST с retry на 429 =====
 async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, retries: int = 3) -> dict:
     for attempt in range(retries):
         async with session.post(url, headers=ozon_headers(), json=payload) as resp:
@@ -140,23 +163,21 @@ async def fetch_supply_order_details(session: aiohttp.ClientSession, order_ids: 
     return orders
 
 
-# ===== ТОВАРЫ ИЗ БАНДЛОВ (с задержкой чтобы не получить 429) =====
+# ===== ТОВАРЫ ИЗ БАНДЛОВ =====
 async def fetch_bundle_items(session: aiohttp.ClientSession, bundle_ids: list) -> dict:
     result = {}
     for bid in bundle_ids:
         try:
-            data  = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle", {"bundle_ids": [bid], "last_id": "", "limit": 100})
-            items = data.get("items", [])
-            result[bid] = items
+            data  = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle",
+                                    {"bundle_ids": [bid], "last_id": "", "limit": 100})
+            result[bid] = data.get("items", [])
         except Exception as e:
             logging.warning(f"bundle {bid}: {e}")
-
     return result
 
 
-# ===== КЛЮЧ НАЗНАЧЕНИЯ ЗАЯВКИ (склад или кластер) =====
+# ===== КЛЮЧ И МЕТКА НАЗНАЧЕНИЯ =====
 def get_dest_key(order: dict) -> str:
-    """Возвращает уникальный ключ назначения для группировки."""
     for supply in order.get("supplies", []):
         storage_wh = supply.get("storage_warehouse") or {}
         wh_name    = storage_wh.get("name", "")
@@ -169,7 +190,6 @@ def get_dest_key(order: dict) -> str:
 
 
 def get_dest_label(dest_key: str) -> str:
-    """Человекочитаемое название для кнопки."""
     if dest_key.startswith("wh::"):
         return dest_key[4:]
     if dest_key.startswith("cl::"):
@@ -177,9 +197,8 @@ def get_dest_label(dest_key: str) -> str:
     return dest_key
 
 
-# ===== ЗАГРУЗКА ВСЕХ ДАННЫХ И ГРУППИРОВКА =====
+# ===== ЗАГРУЗКА И ГРУППИРОВКА ВСЕХ ЗАЯВОК =====
 async def load_all_orders() -> dict:
-    """Загружает все заявки DATA_FILLING, возвращает {dest_key: [order, ...]}"""
     async with aiohttp.ClientSession() as session:
         order_ids = await fetch_supply_order_ids(session)
         logging.info(f"DATA_FILLING: {len(order_ids)} заявок")
@@ -188,7 +207,6 @@ async def load_all_orders() -> dict:
 
         orders = await fetch_supply_order_details(session, order_ids)
 
-        # Собираем bundle_ids
         bundle_ids = []
         for order in orders:
             for supply in order.get("supplies", []):
@@ -196,15 +214,13 @@ async def load_all_orders() -> dict:
                 if bid:
                     bundle_ids.append(bid)
 
-        bundle_items = await fetch_bundle_items(session, bundle_ids)
+        bundle_items = await fetch_bundle_items(session, bundle_ids) if bundle_ids else {}
 
-        # Прикрепляем товары
         for order in orders:
             for supply in order.get("supplies", []):
                 bid = supply.get("bundle_id")
                 supply["_items"] = bundle_items.get(bid, []) if bid else []
 
-    # Группируем по назначению
     grouped: dict = {}
     for order in orders:
         key = get_dest_key(order)
@@ -217,7 +233,7 @@ async def load_all_orders() -> dict:
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 Ближайшие заявки на перенос", callback_data="show_skus")],
-        [InlineKeyboardButton(text="🚚 Заявки на поставку", callback_data="show_supplies")],
+        [InlineKeyboardButton(text="🚚 Заявки на поставку",          callback_data="show_supplies")],
     ])
 
 
@@ -226,13 +242,12 @@ def dest_menu(grouped: dict) -> InlineKeyboardMarkup:
     buttons = []
     for dest_key, orders in sorted(grouped.items(), key=lambda x: get_dest_label(x[0])):
         label = f"{get_dest_label(dest_key)} ({len(orders)})"
-        # callback_data ограничен 64 байтами — используем индекс
         buttons.append([InlineKeyboardButton(
             text=label,
             callback_data=f"dest::{dest_key[:50]}"
         )])
-    buttons.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="show_supplies")])
-    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить",      callback_data="show_supplies")])
+    buttons.append([InlineKeyboardButton(text="◀️ Главное меню",  callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -253,20 +268,19 @@ async def cmd_start(message: types.Message):
     await bot.send_message(chat_id=chat_id, text="Привет! Выбери действие:", reply_markup=main_menu())
 
 
-# ===== КНОПКА: ГЛАВНОЕ МЕНЮ =====
+# ===== ГЛАВНОЕ МЕНЮ (callback) =====
 @dp.callback_query(F.data == "main_menu")
 async def handle_main_menu(call: CallbackQuery):
     await call.answer()
     await call.message.edit_text("Выбери действие:", reply_markup=main_menu())
 
 
-# ===== КНОПКА: БЛИЖАЙШИЕ ЗАЯВКИ НА ПЕРЕНОС =====
+# ===== БЛИЖАЙШИЕ ЗАЯВКИ НА ПЕРЕНОС =====
 @dp.callback_query(F.data == "show_skus")
 async def handle_show_skus(call: CallbackQuery):
     await call.answer()
     await call.message.edit_text("⏳ Ищу заявки с датой поставки в ближайшие 5 дней...")
 
-    # Берём из кэша если есть, иначе загружаем
     grouped = _cache.get("grouped")
     if not grouped:
         try:
@@ -276,12 +290,10 @@ async def handle_show_skus(call: CallbackQuery):
             await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
             return
 
-    # Все заявки из всех групп
     all_orders = [order for orders in grouped.values() for order in orders]
 
-    # Фильтруем по дате из timeslot
-    now      = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    date_to  = now + timedelta(days=5)
+    now     = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    date_to = now + timedelta(days=5)
 
     near_orders = []
     for order in all_orders:
@@ -297,7 +309,6 @@ async def handle_show_skus(call: CallbackQuery):
         except Exception:
             continue
 
-    # Сортируем по дате
     near_orders.sort(key=lambda x: x[0])
 
     if not near_orders:
@@ -307,7 +318,6 @@ async def handle_show_skus(call: CallbackQuery):
         )
         return
 
-    # Собираем product_id для названий
     all_pids = set()
     for _, order in near_orders:
         for supply in order.get("supplies", []):
@@ -325,14 +335,12 @@ async def handle_show_skus(call: CallbackQuery):
         order_num = order.get("order_number", "")
         created   = order.get("created_date", "")[:10]
         deadline  = (order.get("data_filling_deadline") or "")[:10]
-        ts_from   = dt.strftime("%Y-%m-%d %H:%M")
-        dest_key  = get_dest_key(order)
-        dest      = get_dest_label(dest_key)
+        dest      = get_dest_label(get_dest_key(order))
 
         lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append(f"📋 #{order_id} ({order_num})")
         lines.append(f"🏭 Назначение: {dest}")
-        lines.append(f"🗓 Дата поставки: {ts_from}")
+        lines.append(f"🗓 Дата поставки: {dt.strftime('%Y-%m-%d %H:%M')}")
         lines.append(f"📅 Создана: {created}")
         if deadline:
             lines.append(f"⏰ Дедлайн: {deadline}")
@@ -352,8 +360,7 @@ async def handle_show_skus(call: CallbackQuery):
 
     text_full = "\n".join(lines)
     chunks    = [text_full[i:i + 4000] for i in range(0, len(text_full), 4000)]
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+    back_kb   = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
 
@@ -365,7 +372,7 @@ async def handle_show_skus(call: CallbackQuery):
         await call.message.answer("⬆️ Список выше", reply_markup=back_kb)
 
 
-# ===== КНОПКА: ЗАЯВКИ — ПОКАЗАТЬ СКЛАДЫ/КЛАСТЕРЫ =====
+# ===== ЗАЯВКИ — ПОКАЗАТЬ СКЛАДЫ/КЛАСТЕРЫ =====
 @dp.callback_query(F.data == "show_supplies")
 async def handle_show_supplies(call: CallbackQuery):
     await call.answer()
@@ -389,15 +396,13 @@ async def handle_show_supplies(call: CallbackQuery):
     )
 
 
-# ===== КНОПКА: ВЫБРАН СКЛАД/КЛАСТЕР =====
+# ===== ВЫБРАН СКЛАД/КЛАСТЕР =====
 @dp.callback_query(F.data.startswith("dest::"))
 async def handle_dest_select(call: CallbackQuery):
     await call.answer()
-    dest_key = call.data[6:]  # убираем "dest::"
-
+    dest_key = call.data[6:]
     grouped  = _cache.get("grouped", {})
 
-    # Ищем ключ (может быть обрезан до 50 символов)
     matched_key = None
     for k in grouped:
         if k[:50] == dest_key:
@@ -411,7 +416,6 @@ async def handle_dest_select(call: CallbackQuery):
     orders = grouped[matched_key]
     label  = get_dest_label(matched_key)
 
-    # Собираем product_id для названий
     all_pids = set()
     for order in orders:
         for supply in order.get("supplies", []):
@@ -455,9 +459,7 @@ async def handle_dest_select(call: CallbackQuery):
 
     text_full = "\n".join(lines)
     chunks    = [text_full[i:i + 4000] for i in range(0, len(text_full), 4000)]
-
-    # Кнопка назад
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+    back_kb   = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="◀️ Назад к складам", callback_data="back_to_dests")],
         [InlineKeyboardButton(text="🏠 Главное меню",    callback_data="main_menu")],
     ])
@@ -466,14 +468,11 @@ async def handle_dest_select(call: CallbackQuery):
     for i, chunk in enumerate(chunks[1:], 1):
         kb = back_kb if i == len(chunks) - 1 else None
         await call.message.answer(chunk, reply_markup=kb)
-
-    if len(chunks) == 1:
-        pass  # кнопка уже добавлена выше
-    else:
+    if len(chunks) > 1:
         await call.message.answer("⬆️ Список выше", reply_markup=back_kb)
 
 
-# ===== КНОПКА: НАЗАД К СКЛАДАМ =====
+# ===== НАЗАД К СКЛАДАМ =====
 @dp.callback_query(F.data == "back_to_dests")
 async def handle_back_to_dests(call: CallbackQuery):
     await call.answer()
@@ -496,8 +495,9 @@ async def handle_back_to_dests(call: CallbackQuery):
 
 # ===== ЗАПУСК =====
 async def main():
-    await load_cluster_names()  # загружаем названия кластеров при старте
+    await load_cluster_names()
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
