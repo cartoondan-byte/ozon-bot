@@ -30,7 +30,7 @@ def ozon_headers() -> dict:
     }
 
 
-# ===== ВСПОМОГАТЕЛЬНАЯ: POST-запрос с логированием =====
+# ===== ВСПОМОГАТЕЛЬНАЯ: POST-запрос =====
 async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
     async with session.post(url, headers=ozon_headers(), json=payload) as resp:
         raw = await resp.text()
@@ -67,7 +67,7 @@ async def fetch_all_skus() -> list[dict]:
 
 
 # ===== ПОЛУЧЕНИЕ НАЗВАНИЙ ТОВАРОВ =====
-async def fetch_product_names(product_ids: list[int]) -> dict[int, str]:
+async def fetch_product_names(product_ids: list) -> dict:
     result     = {}
     chunk_size = 1000
 
@@ -77,27 +77,30 @@ async def fetch_product_names(product_ids: list[int]) -> dict[int, str]:
             try:
                 data = await ozon_post(
                     session,
-                    f"{OZON_API_URL}/v2/product/info/list",
+                    f"{OZON_API_URL}/v3/product/info/list",
                     {"product_id": chunk}
                 )
-                for item in data.get("result", {}).get("items", []):
+                for item in data.get("items", []):
                     pid = item.get("id")
                     if pid:
                         result[pid] = item.get("name", "—")
             except Exception as e:
-                logging.warning(f"Не удалось получить названия товаров: {e}")
+                logging.warning(f"product/info/list ошибка: {e}")
 
     return result
 
 
-# ===== ШАГ 1: получить список order_id через /v3/supply-order/list =====
+# ===== ШАГ 1: список order_id через /v3/supply-order/list =====
 async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
     order_ids = []
-    last_id   = ""   # строка, как требует API
+    last_id   = ""
     limit     = 50
 
     while True:
-        payload = {"limit": limit}
+        payload = {
+            "limit":    limit,
+            "sort_by":  "SUPPLY_DATE_ASC",  # обязательный enum, не может быть 0
+        }
         if last_id:
             payload["last_id"] = last_id
 
@@ -107,14 +110,12 @@ async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
             logging.warning(f"supply-order/list ошибка: {e}")
             break
 
-        # Поддержка разных форматов ответа
+        # Ответ может быть списком int или списком dict
         batch = data.get("order_ids", data.get("orders", []))
-
         if not batch:
             break
 
-        # Список int или список dict
-        if batch and isinstance(batch[0], dict):
+        if isinstance(batch[0], dict):
             ids = [o.get("order_id") for o in batch if o.get("order_id")]
         else:
             ids = [oid for oid in batch if oid]
@@ -129,11 +130,8 @@ async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
     return order_ids
 
 
-# ===== ШАГ 2: получить детали заявок через /v3/supply-order/get =====
-async def fetch_supply_order_details(
-    session: aiohttp.ClientSession,
-    order_ids: list
-) -> list[dict]:
+# ===== ШАГ 2: детали заявок через /v3/supply-order/get =====
+async def fetch_supply_order_details(session: aiohttp.ClientSession, order_ids: list) -> list[dict]:
     orders     = []
     chunk_size = 50
 
@@ -200,10 +198,30 @@ def main_menu() -> InlineKeyboardMarkup:
     ])
 
 
-# ===== СТАРТ =====
+# ===== СТАРТ: удаляем старые сообщения и показываем меню =====
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer("Привет! Выбери действие:", reply_markup=main_menu())
+    # Удаляем сообщение пользователя /start
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    # Удаляем до 50 предыдущих сообщений бота в чате
+    chat_id    = message.chat.id
+    message_id = message.message_id
+
+    for mid in range(message_id - 1, max(message_id - 50, 0), -1):
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass  # Пропускаем если уже удалено или нет доступа
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text="Привет! Выбери действие:",
+        reply_markup=main_menu()
+    )
 
 
 # ===== КНОПКА: ВСЕ SKU =====
