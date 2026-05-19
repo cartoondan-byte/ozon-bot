@@ -37,7 +37,7 @@ async def fetch_all_skus() -> list[dict]:
                 "limit":   limit,
             }
             async with session.post(
-                f"{OZON_API_URL}/v2/product/list",
+                f"{OZON_API_URL}/v3/product/list",
                 headers=headers,
                 json=payload,
             ) as resp:
