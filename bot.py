@@ -20,71 +20,40 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp  = Dispatcher()
 
-# ===== МАППИНГ КЛАСТЕРОВ (macrolocal_cluster_id → название) =====
-# Берём из официальной документации Ozon / личного кабинета
-CLUSTER_NAMES = {
-    "4071": "Ростов-на-Дону",
-    "4072": "Краснодар",
-    "4073": "Ставрополь",
-    "4074": "Воронеж",
-    "4075": "Волгоград",
-    "4076": "Саратов",
-    "4077": "Самара",
-    "4078": "Казань",
-    "4079": "Нижний Новгород",
-    "4080": "Уфа",
-    "4081": "Пермь",
-    "4082": "Екатеринбург",
-    "4083": "Тюмень",
-    "4084": "Новосибирск",
-    "4085": "Омск",
-    "4086": "Красноярск",
-    "4087": "Иркутск",
-    "4088": "Хабаровск",
-    "4089": "Владивосток",
-    "4090": "Москва",
-    "4091": "Санкт-Петербург",
-    "4092": "Челябинск",
-    "4093": "Белгород",
-    "4094": "Липецк",
-    "4095": "Тула",
-    "4096": "Рязань",
-    "4097": "Пенза",
-    "4098": "Тольятти",
-    "4099": "Оренбург",
-    "4100": "Ижевск",
-    "4101": "Киров",
-    "4102": "Чебоксары",
-    "4103": "Ярославль",
-    "4104": "Иваново",
-    "4105": "Тверь",
-    "4106": "Смоленск",
-    "4107": "Брянск",
-    "4108": "Орёл",
-    "4109": "Курск",
-    "4110": "Тамбов",
-    "4111": "Астрахань",
-    "4112": "Махачкала",
-    "4113": "Владикавказ",
-    "4114": "Нальчик",
-    "4115": "Грозный",
-    "4116": "Черкесск",
-    "4117": "Майкоп",
-    "4118": "Сочи",
-    "4119": "Новороссийск",
-    "4120": "Барнаул",
-    "4121": "Кемерово",
-    "4122": "Томск",
-    "4123": "Улан-Удэ",
-    "4124": "Чита",
-    "4125": "Якутск",
-    "4126": "Благовещенск",
-    "4127": "Южно-Сахалинск",
-}
+# ===== МАППИНГ КЛАСТЕРОВ (загружается из API при старте) =====
+CLUSTER_NAMES: dict = {}
 
 def cluster_name(cluster_id: str) -> str:
-    """Возвращает название кластера или 'Кластер {id}' если не найден."""
-    return CLUSTER_NAMES.get(str(cluster_id), f"Кластер {cluster_id}")
+    """Возвращает 'Кластер {название}' или 'Кластер {id}' если не найден."""
+    name = CLUSTER_NAMES.get(str(cluster_id), "")
+    if name:
+        return f"Кластер {name}"
+    return f"Кластер {cluster_id}"
+
+async def load_cluster_names() -> None:
+    """Загружает список кластеров из /v1/cluster/list и заполняет CLUSTER_NAMES."""
+    global CLUSTER_NAMES
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{OZON_API_URL}/v1/cluster/list",
+                headers=ozon_headers(),
+                json={}
+            ) as resp:
+                raw  = await resp.text()
+                data = json.loads(raw)
+                logging.info(f"cluster/list → {resp.status} | {raw[:400]}")
+
+        clusters = data.get("clusters", data.get("result", []))
+        for c in clusters:
+            cid  = str(c.get("cluster_id", c.get("id", "")))
+            name = c.get("name", c.get("cluster_name", ""))
+            if cid and name:
+                CLUSTER_NAMES[cid] = name
+
+        logging.info(f"Загружено кластеров: {len(CLUSTER_NAMES)}")
+    except Exception as e:
+        logging.warning(f"Не удалось загрузить кластеры: {e}")
 
 
 # ===== КЭШ ДАННЫХ (чтобы не перезапрашивать при навигации) =====
@@ -527,6 +496,7 @@ async def handle_back_to_dests(call: CallbackQuery):
 
 # ===== ЗАПУСК =====
 async def main():
+    await load_cluster_names()  # загружаем названия кластеров при старте
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
