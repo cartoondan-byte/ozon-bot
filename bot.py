@@ -30,7 +30,7 @@ def ozon_headers() -> dict:
     }
 
 
-# ===== ВСПОМОГАТЕЛЬНАЯ: POST-запрос =====
+# ===== POST-запрос =====
 async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
     async with session.post(url, headers=ozon_headers(), json=payload) as resp:
         raw = await resp.text()
@@ -66,7 +66,7 @@ async def fetch_all_skus() -> list[dict]:
     return skus
 
 
-# ===== ПОЛУЧЕНИЕ НАЗВАНИЙ ТОВАРОВ =====
+# ===== НАЗВАНИЯ ТОВАРОВ =====
 async def fetch_product_names(product_ids: list) -> dict:
     result     = {}
     chunk_size = 1000
@@ -98,9 +98,7 @@ async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
 
     while True:
         payload = {
-            "filter": {
-                "states": ["DATA_FILLING"],
-            },
+            "filter":  {"states": ["DATA_FILLING"]},
             "sort_by": 1,
             "limit":   limit,
         }
@@ -123,7 +121,7 @@ async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
     return order_ids
 
 
-# ===== ДЕТАЛИ ЗАЯВОК через /v3/supply-order/get =====
+# ===== ДЕТАЛИ ЗАЯВОК =====
 async def fetch_supply_order_details(session: aiohttp.ClientSession, order_ids: list) -> list[dict]:
     orders     = []
     chunk_size = 50
@@ -136,20 +134,42 @@ async def fetch_supply_order_details(session: aiohttp.ClientSession, order_ids: 
                 f"{OZON_API_URL}/v3/supply-order/get",
                 {"order_ids": chunk}
             )
-            batch = data.get("orders", [])
-
-            # Логируем ПОЛНУЮ структуру первой заявки для отладки
-            if batch and not orders:
-                logging.info(f"=== ПОЛНАЯ СТРУКТУРА ПЕРВОЙ ЗАЯВКИ ===\n{json.dumps(batch[0], ensure_ascii=False, indent=2)}")
-
-            orders.extend(batch)
+            orders.extend(data.get("orders", []))
         except Exception as e:
             logging.warning(f"supply-order/get chunk {chunk}: {e}")
 
     return orders
 
 
-# ===== ОСНОВНАЯ ФУНКЦИЯ ПОСТАВОК =====
+# ===== ТОВАРЫ ИЗ БАНДЛОВ =====
+async def fetch_bundle_items(session: aiohttp.ClientSession, bundle_ids: list) -> dict:
+    """
+    Возвращает {bundle_id: [{"sku": ..., "product_id": ..., "quantity": ...}]}
+    """
+    result     = {}
+    chunk_size = 50
+    last_id    = ""
+
+    # bundle запрос принимает список bundle_ids + пагинация
+    for i in range(0, len(bundle_ids), chunk_size):
+        chunk = bundle_ids[i:i + chunk_size]
+        try:
+            payload = {"bundle_ids": chunk, "last_id": last_id, "limit": 100}
+            data    = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle", payload)
+            bundles = data.get("bundles", [])
+            logging.info(f"bundle ответ: {json.dumps(data, ensure_ascii=False)[:400]}")
+            for bundle in bundles:
+                bid   = bundle.get("bundle_id")
+                items = bundle.get("items", [])
+                if bid:
+                    result[bid] = items
+        except Exception as e:
+            logging.warning(f"supply-order/bundle ошибка: {e}")
+
+    return result
+
+
+# ===== ОСНОВНАЯ ФУНКЦИЯ =====
 async def fetch_supply_requests() -> list[dict]:
     async with aiohttp.ClientSession() as session:
         order_ids = await fetch_supply_order_ids(session)
@@ -158,7 +178,28 @@ async def fetch_supply_requests() -> list[dict]:
         if not order_ids:
             return []
 
-        return await fetch_supply_order_details(session, order_ids)
+        orders = await fetch_supply_order_details(session, order_ids)
+
+        # Собираем все bundle_id
+        bundle_ids = []
+        for order in orders:
+            for supply in order.get("supplies", []):
+                bid = supply.get("bundle_id")
+                if bid:
+                    bundle_ids.append(bid)
+
+        # Получаем товары по бандлам
+        bundle_items = {}
+        if bundle_ids:
+            bundle_items = await fetch_bundle_items(session, bundle_ids)
+
+        # Прикрепляем товары к поставкам
+        for order in orders:
+            for supply in order.get("supplies", []):
+                bid = supply.get("bundle_id")
+                supply["_items"] = bundle_items.get(bid, []) if bid else []
+
+        return orders
 
 
 # ===== ГЛАВНОЕ МЕНЮ =====
@@ -169,7 +210,7 @@ def main_menu() -> InlineKeyboardMarkup:
     ])
 
 
-# ===== СТАРТ: удаляем старые сообщения =====
+# ===== СТАРТ =====
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
     try:
@@ -229,7 +270,7 @@ async def handle_show_skus(call: CallbackQuery):
 @dp.callback_query(F.data == "show_supplies")
 async def handle_show_supplies(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("⏳ Загружаю заявки со статусом «Заполнение данных»...")
+    await call.message.edit_text("⏳ Загружаю заявки «Заполнение данных»...")
 
     try:
         orders = await fetch_supply_requests()
@@ -244,28 +285,14 @@ async def handle_show_supplies(call: CallbackQuery):
         )
         return
 
-    # Временно выводим сырую структуру первой заявки чтобы понять поля
-    first = orders[0]
-    debug_keys = {
-        "order_id":    first.get("order_id"),
-        "state":       first.get("state"),
-        "supplies_keys": list(first.get("supplies", [{}])[0].keys()) if first.get("supplies") else "нет supplies",
-        "top_keys":    list(first.keys()),
-    }
-    logging.info(f"DEBUG first order keys: {json.dumps(debug_keys, ensure_ascii=False)}")
-
-    # Собираем product_id
+    # Собираем product_id для получения названий
     all_product_ids = set()
     for order in orders:
         for supply in order.get("supplies", []):
-            for item in supply.get("items", supply.get("bundles", [])):
-                pid = item.get("product_id") or item.get("sku")
+            for item in supply.get("_items", []):
+                pid = item.get("product_id")
                 if pid:
                     all_product_ids.add(pid)
-        for item in order.get("items", order.get("bundles", [])):
-            pid = item.get("product_id") or item.get("sku")
-            if pid:
-                all_product_ids.add(pid)
 
     try:
         names = await fetch_product_names(list(all_product_ids))
@@ -275,52 +302,45 @@ async def handle_show_supplies(call: CallbackQuery):
     lines = [f"🚚 Заявок «Заполнение данных»: {len(orders)}\n"]
 
     for order in orders:
-        order_id     = order.get("order_id", "—")
-        order_number = order.get("order_number", "")
-        created      = order.get("created_date", "")[:10]
-        deadline     = (order.get("data_filling_deadline") or "")[:10]
+        order_id  = order.get("order_id", "—")
+        order_num = order.get("order_number", "")
+        created   = order.get("created_date", "")[:10]
+        deadline  = (order.get("data_filling_deadline") or "")[:10]
 
-        # Дедлайн заполнения данных
-        deadline_str = f" | ⏰ Дедлайн: {deadline}" if deadline else ""
+        # Дата поставки из timeslot
+        ts       = order.get("timeslot", {}).get("timeslot", {})
+        ts_from  = (ts.get("from") or "")[:10]
 
         lines.append("━━━━━━━━━━━━━━━━━━")
-        lines.append(f"📋 Заявка #{order_id} ({order_number})")
-        lines.append(f"📅 Создана: {created}{deadline_str}")
+        lines.append(f"📋 Заявка #{order_id} ({order_num})")
+        lines.append(f"📅 Создана: {created}")
+        if ts_from:
+            lines.append(f"🗓 Дата поставки: {ts_from}")
+        if deadline:
+            lines.append(f"⏰ Дедлайн заполнения: {deadline}")
 
-        # Поставки внутри заявки
-        supplies = order.get("supplies", [])
-        if supplies:
-            for supply in supplies:
-                # Дата поставки
-                arrival = (
-                    supply.get("arrival_date") or
-                    supply.get("planned_arrival_date") or
-                    supply.get("supply_date") or ""
-                )[:10]
+        for supply in order.get("supplies", []):
+            # Склад назначения: старый формат — storage_warehouse, новый — macrolocal_cluster_id
+            storage_wh  = supply.get("storage_warehouse") or {}
+            cluster_id  = supply.get("macrolocal_cluster_id", "")
+            dest = (
+                storage_wh.get("name") or
+                storage_wh.get("address") or
+                (f"Кластер {cluster_id}" if cluster_id else "—")
+            )
+            lines.append(f"🏭 Назначение: {dest}")
 
-                # Склад назначения (новый формат — кластер, старый — warehouse)
-                cluster  = supply.get("cluster", {})
-                wh       = supply.get("warehouse", supply.get("destination_warehouse", {}))
-                dest     = (
-                    cluster.get("name") or cluster.get("cluster_name") or
-                    wh.get("name") or wh.get("warehouse_name") or "—"
-                ) if isinstance(cluster, dict) else "—"
-
-                lines.append(f"📦 Дата: {arrival or '—'} | Склад/Кластер: {dest}")
-
-                # Товары
-                items = supply.get("items", supply.get("bundles", []))
-                if items:
-                    for item in items:
-                        sku        = item.get("sku", "—")
-                        product_id = item.get("product_id")
-                        qty        = item.get("quantity", item.get("quantity_in_supply", "—"))
-                        name       = names.get(product_id, "—") if product_id else "—"
-                        lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
-                else:
-                    lines.append("  Товары: нет данных")
-        else:
-            lines.append("  Поставки: нет данных")
+            items = supply.get("_items", [])
+            if items:
+                lines.append("Товары:")
+                for item in items:
+                    sku        = item.get("sku", "—")
+                    product_id = item.get("product_id")
+                    qty        = item.get("quantity", item.get("quantity_in_supply", "—"))
+                    name       = names.get(product_id, "—") if product_id else "—"
+                    lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
+            else:
+                lines.append("  Товары: загружаются отдельно")
 
         lines.append("")
 
