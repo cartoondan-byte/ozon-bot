@@ -117,27 +117,6 @@ async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, ret
     raise Exception(f"Превышен лимит запросов к {url}")
 
 
-# ===== ПОЛУЧЕНИЕ ВСЕХ SKU =====
-async def fetch_all_skus() -> list[dict]:
-    skus    = []
-    last_id = ""
-    limit   = 1000
-
-    async with aiohttp.ClientSession() as session:
-        while True:
-            payload = {"filter": {"visibility": "ALL"}, "last_id": last_id, "limit": limit}
-            data    = await ozon_post(session, f"{OZON_API_URL}/v3/product/list", payload)
-            items   = data.get("result", {}).get("items", [])
-            last_id = data.get("result", {}).get("last_id", "")
-            if not items:
-                break
-            skus.extend(items)
-            if len(items) < limit:
-                break
-
-    return skus
-
-
 # ===== НАЗВАНИЯ ТОВАРОВ =====
 async def fetch_product_names(product_ids: list) -> dict:
     result = {}
@@ -268,7 +247,7 @@ async def load_all_orders() -> dict:
 # ===== ГЛАВНОЕ МЕНЮ =====
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 Все SKU",            callback_data="show_skus")],
+        [InlineKeyboardButton(text="📅 Ближайшие заявки на перенос", callback_data="show_skus")],
         [InlineKeyboardButton(text="🚚 Заявки на поставку", callback_data="show_supplies")],
     ])
 
@@ -312,31 +291,109 @@ async def handle_main_menu(call: CallbackQuery):
     await call.message.edit_text("Выбери действие:", reply_markup=main_menu())
 
 
-# ===== КНОПКА: ВСЕ SKU =====
+# ===== КНОПКА: БЛИЖАЙШИЕ ЗАЯВКИ НА ПЕРЕНОС =====
 @dp.callback_query(F.data == "show_skus")
 async def handle_show_skus(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("⏳ Загружаю список артикулов...")
+    await call.message.edit_text("⏳ Ищу заявки с датой поставки в ближайшие 5 дней...")
 
-    try:
-        items = await fetch_all_skus()
-    except Exception as e:
-        await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
+    # Берём из кэша если есть, иначе загружаем
+    grouped = _cache.get("grouped")
+    if not grouped:
+        try:
+            grouped = await load_all_orders()
+            _cache["grouped"] = grouped
+        except Exception as e:
+            await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
+            return
+
+    # Все заявки из всех групп
+    all_orders = [order for orders in grouped.values() for order in orders]
+
+    # Фильтруем по дате из timeslot
+    now      = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    date_to  = now + timedelta(days=5)
+
+    near_orders = []
+    for order in all_orders:
+        ts      = order.get("timeslot", {}).get("timeslot", {})
+        ts_from = ts.get("from", "")
+        if not ts_from:
+            continue
+        try:
+            dt = datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S")
+            dt = MOSCOW_TZ.localize(dt)
+            if now <= dt <= date_to:
+                near_orders.append((dt, order))
+        except Exception:
+            continue
+
+    # Сортируем по дате
+    near_orders.sort(key=lambda x: x[0])
+
+    if not near_orders:
+        await call.message.edit_text(
+            "📭 Заявок с датой поставки в ближайшие 5 дней не найдено.",
+            reply_markup=main_menu()
+        )
         return
 
-    if not items:
-        await call.message.edit_text("📭 Артикулы не найдены.", reply_markup=main_menu())
-        return
+    # Собираем product_id для названий
+    all_pids = set()
+    for _, order in near_orders:
+        for supply in order.get("supplies", []):
+            for item in supply.get("_items", []):
+                pid = item.get("product_id")
+                if pid:
+                    all_pids.add(pid)
 
-    lines = [f"{i}. {item.get('offer_id','—')} | product_id: {item.get('product_id','—')}"
-             for i, item in enumerate(items, 1)]
+    names = await fetch_product_names(list(all_pids)) if all_pids else {}
+
+    lines = [f"📅 Заявок в ближайшие 5 дней: {len(near_orders)}\n"]
+
+    for dt, order in near_orders:
+        order_id  = order.get("order_id", "—")
+        order_num = order.get("order_number", "")
+        created   = order.get("created_date", "")[:10]
+        deadline  = (order.get("data_filling_deadline") or "")[:10]
+        ts_from   = dt.strftime("%Y-%m-%d %H:%M")
+        dest_key  = get_dest_key(order)
+        dest      = get_dest_label(dest_key)
+
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📋 #{order_id} ({order_num})")
+        lines.append(f"🏭 Назначение: {dest}")
+        lines.append(f"🗓 Дата поставки: {ts_from}")
+        lines.append(f"📅 Создана: {created}")
+        if deadline:
+            lines.append(f"⏰ Дедлайн: {deadline}")
+
+        for supply in order.get("supplies", []):
+            items = supply.get("_items", [])
+            if items:
+                lines.append("Товары:")
+                for item in items:
+                    sku  = item.get("sku", "—")
+                    pid  = item.get("product_id")
+                    qty  = item.get("quantity", "—")
+                    name = names.get(pid, item.get("name", "—"))
+                    lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
+
+        lines.append("")
+
     text_full = "\n".join(lines)
     chunks    = [text_full[i:i + 4000] for i in range(0, len(text_full), 4000)]
 
-    await call.message.edit_text(f"📦 Найдено артикулов: {len(items)}\n\n" + chunks[0])
-    for chunk in chunks[1:]:
-        await call.message.answer(chunk)
-    await call.message.answer("Готово!", reply_markup=main_menu())
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+
+    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
+    for i, chunk in enumerate(chunks[1:], 1):
+        kb = back_kb if i == len(chunks) - 1 else None
+        await call.message.answer(chunk, reply_markup=kb)
+    if len(chunks) > 1:
+        await call.message.answer("⬆️ Список выше", reply_markup=back_kb)
 
 
 # ===== КНОПКА: ЗАЯВКИ — ПОКАЗАТЬ СКЛАДЫ/КЛАСТЕРЫ =====
