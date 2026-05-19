@@ -91,29 +91,29 @@ async def fetch_product_names(product_ids: list[int]) -> dict[int, str]:
 
 
 # ===== ШАГ 1: получить список order_id через /v3/supply-order/list =====
-async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list[int]:
-    """
-    Получает все order_id заявок на поставку через /v3/supply-order/list.
-    Фильтр по дате применяем на стороне бота.
-    """
+async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
     order_ids = []
-    last_id   = 0
+    last_id   = ""   # строка, как требует API
     limit     = 50
 
     while True:
-        payload = {
-            "last_id": last_id,
-            "limit":   limit,
-        }
+        payload = {"limit": limit}
+        if last_id:
+            payload["last_id"] = last_id
+
         try:
             data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", payload)
         except Exception as e:
             logging.warning(f"supply-order/list ошибка: {e}")
             break
 
+        # Поддержка разных форматов ответа
         batch = data.get("order_ids", data.get("orders", []))
 
-        # Поддержка двух форматов ответа: список int или список dict
+        if not batch:
+            break
+
+        # Список int или список dict
         if batch and isinstance(batch[0], dict):
             ids = [o.get("order_id") for o in batch if o.get("order_id")]
         else:
@@ -121,7 +121,7 @@ async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list[int]:
 
         order_ids.extend(ids)
 
-        new_last_id = data.get("last_id", 0)
+        new_last_id = str(data.get("last_id", ""))
         if not new_last_id or new_last_id == last_id or len(ids) < limit:
             break
         last_id = new_last_id
@@ -132,10 +132,10 @@ async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list[int]:
 # ===== ШАГ 2: получить детали заявок через /v3/supply-order/get =====
 async def fetch_supply_order_details(
     session: aiohttp.ClientSession,
-    order_ids: list[int]
+    order_ids: list
 ) -> list[dict]:
     orders     = []
-    chunk_size = 50  # API принимает 1–50 за раз
+    chunk_size = 50
 
     for i in range(0, len(order_ids), chunk_size):
         chunk = order_ids[i:i + chunk_size]
@@ -159,7 +159,6 @@ def filter_orders_by_date(orders: list[dict]) -> list[dict]:
     filtered = []
 
     for order in orders:
-        # Ищем дату поставки в supplies[].arrival_date или supply_date
         supply_date_str = order.get("supply_date", "")
         if not supply_date_str:
             supplies = order.get("supplies", [])
@@ -175,7 +174,6 @@ def filter_orders_by_date(orders: list[dict]) -> list[dict]:
             except Exception:
                 pass
         else:
-            # Если дата не указана — включаем на всякий случай
             filtered.append(order)
 
     return filtered
