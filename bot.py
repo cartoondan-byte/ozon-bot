@@ -34,7 +34,7 @@ def ozon_headers() -> dict:
 async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
     async with session.post(url, headers=ozon_headers(), json=payload) as resp:
         raw = await resp.text()
-        logging.info(f"POST {url} → {resp.status} | {raw[:600]}")
+        logging.info(f"POST {url} → {resp.status} | {raw[:300]}")
         if resp.status != 200:
             raise Exception(f"HTTP {resp.status} [{url}]: {raw[:300]}")
         return json.loads(raw)
@@ -90,18 +90,8 @@ async def fetch_product_names(product_ids: list) -> dict:
     return result
 
 
-# ===== ПОЛУЧЕНИЕ order_id через /v3/supply-order/list =====
+# ===== ПОЛУЧЕНИЕ order_id — только DATA_FILLING =====
 async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
-    now       = datetime.now(MOSCOW_TZ)
-    date_from = now.strftime("%Y-%m-%dT00:00:00Z")
-    date_to   = (now + timedelta(days=5)).strftime("%Y-%m-%dT23:59:59Z")
-
-    all_states = [
-        "PLANNED", "ACCEPTED", "IN_PROGRESS", "COMPLETED",
-        "CANCELLED", "DRAFT", "CONFIRMED", "REJECTED",
-        "CREATED", "APPROVED",
-    ]
-
     order_ids = []
     last_id   = ""
     limit     = 50
@@ -109,9 +99,7 @@ async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
     while True:
         payload = {
             "filter": {
-                "supply_date_from": date_from,
-                "supply_date_to":   date_to,
-                "states":           all_states,
+                "states": ["DATA_FILLING"],
             },
             "sort_by": 1,
             "limit":   limit,
@@ -148,7 +136,13 @@ async def fetch_supply_order_details(session: aiohttp.ClientSession, order_ids: 
                 f"{OZON_API_URL}/v3/supply-order/get",
                 {"order_ids": chunk}
             )
-            orders.extend(data.get("orders", []))
+            batch = data.get("orders", [])
+
+            # Логируем ПОЛНУЮ структуру первой заявки для отладки
+            if batch and not orders:
+                logging.info(f"=== ПОЛНАЯ СТРУКТУРА ПЕРВОЙ ЗАЯВКИ ===\n{json.dumps(batch[0], ensure_ascii=False, indent=2)}")
+
+            orders.extend(batch)
         except Exception as e:
             logging.warning(f"supply-order/get chunk {chunk}: {e}")
 
@@ -159,73 +153,12 @@ async def fetch_supply_order_details(session: aiohttp.ClientSession, order_ids: 
 async def fetch_supply_requests() -> list[dict]:
     async with aiohttp.ClientSession() as session:
         order_ids = await fetch_supply_order_ids(session)
-        logging.info(f"Получено order_id: {len(order_ids)}")
+        logging.info(f"Заявок DATA_FILLING: {len(order_ids)}")
 
         if not order_ids:
             return []
 
         return await fetch_supply_order_details(session, order_ids)
-
-
-# ===== ПАРСИНГ ОДНОЙ ЗАЯВКИ =====
-def parse_order(order: dict, names: dict) -> list[str]:
-    """
-    Разбирает один объект заявки в список строк для вывода.
-    Реальная структура из API:
-    - order_id, order_number, state
-    - drop_off_warehouse.name, drop_off_warehouse.address
-    - supplies[]: arrival_date, warehouse.name, items[]: sku, product_id, quantity
-    """
-    order_id     = order.get("order_id", "—")
-    order_number = order.get("order_number", "")
-    status       = order.get("state", "—")
-    created      = order.get("created_date", "")[:10]
-
-    # Склад сдачи
-    drop_wh      = order.get("drop_off_warehouse", {})
-    drop_name    = drop_wh.get("name", drop_wh.get("address", "—"))
-
-    lines = []
-    lines.append("━━━━━━━━━━━━━━━━━━")
-    lines.append(f"📋 Заявка #{order_id} ({order_number})")
-    lines.append(f"🔖 Статус: {status}")
-    lines.append(f"📅 Создана: {created}")
-    lines.append(f"🏭 Склад: {drop_name}")
-
-    supplies = order.get("supplies", [])
-    if supplies:
-        for supply in supplies:
-            arrival  = supply.get("arrival_date", supply.get("planned_arrival_date", ""))[:10]
-            wh       = supply.get("warehouse", supply.get("storage_warehouse", {}))
-            wh_name  = wh.get("name", wh.get("warehouse_name", "")) if isinstance(wh, dict) else ""
-            if arrival:
-                lines.append(f"📦 Дата поставки: {arrival}" + (f" | Склад: {wh_name}" if wh_name else ""))
-
-            items = supply.get("items", supply.get("bundles", []))
-            if items:
-                lines.append("Товары:")
-                for item in items:
-                    sku        = item.get("sku", item.get("product_id", "—"))
-                    product_id = item.get("product_id")
-                    qty        = item.get("quantity", item.get("quantity_in_supply", "—"))
-                    name       = names.get(product_id, "—") if product_id else "—"
-                    lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
-    else:
-        # Товары могут быть прямо в заявке
-        items = order.get("items", order.get("bundles", []))
-        if items:
-            lines.append("Товары:")
-            for item in items:
-                sku        = item.get("sku", item.get("product_id", "—"))
-                product_id = item.get("product_id")
-                qty        = item.get("quantity", "—")
-                name       = names.get(product_id, "—") if product_id else "—"
-                lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
-        else:
-            lines.append("Товары: нет данных")
-
-    lines.append("")
-    return lines
 
 
 # ===== ГЛАВНОЕ МЕНЮ =====
@@ -296,7 +229,7 @@ async def handle_show_skus(call: CallbackQuery):
 @dp.callback_query(F.data == "show_supplies")
 async def handle_show_supplies(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("⏳ Загружаю заявки на поставку...")
+    await call.message.edit_text("⏳ Загружаю заявки со статусом «Заполнение данных»...")
 
     try:
         orders = await fetch_supply_requests()
@@ -306,21 +239,31 @@ async def handle_show_supplies(call: CallbackQuery):
 
     if not orders:
         await call.message.edit_text(
-            "📭 Заявок на ближайшие 5 дней не найдено.",
+            "📭 Заявок со статусом «Заполнение данных» не найдено.",
             reply_markup=main_menu()
         )
         return
 
-    # Собираем все product_id для получения названий
+    # Временно выводим сырую структуру первой заявки чтобы понять поля
+    first = orders[0]
+    debug_keys = {
+        "order_id":    first.get("order_id"),
+        "state":       first.get("state"),
+        "supplies_keys": list(first.get("supplies", [{}])[0].keys()) if first.get("supplies") else "нет supplies",
+        "top_keys":    list(first.keys()),
+    }
+    logging.info(f"DEBUG first order keys: {json.dumps(debug_keys, ensure_ascii=False)}")
+
+    # Собираем product_id
     all_product_ids = set()
     for order in orders:
         for supply in order.get("supplies", []):
             for item in supply.get("items", supply.get("bundles", [])):
-                pid = item.get("product_id")
+                pid = item.get("product_id") or item.get("sku")
                 if pid:
                     all_product_ids.add(pid)
         for item in order.get("items", order.get("bundles", [])):
-            pid = item.get("product_id")
+            pid = item.get("product_id") or item.get("sku")
             if pid:
                 all_product_ids.add(pid)
 
@@ -329,9 +272,57 @@ async def handle_show_supplies(call: CallbackQuery):
     except Exception:
         names = {}
 
-    lines = [f"🚚 Заявок на ближайшие 5 дней: {len(orders)}\n"]
+    lines = [f"🚚 Заявок «Заполнение данных»: {len(orders)}\n"]
+
     for order in orders:
-        lines.extend(parse_order(order, names))
+        order_id     = order.get("order_id", "—")
+        order_number = order.get("order_number", "")
+        created      = order.get("created_date", "")[:10]
+        deadline     = (order.get("data_filling_deadline") or "")[:10]
+
+        # Дедлайн заполнения данных
+        deadline_str = f" | ⏰ Дедлайн: {deadline}" if deadline else ""
+
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📋 Заявка #{order_id} ({order_number})")
+        lines.append(f"📅 Создана: {created}{deadline_str}")
+
+        # Поставки внутри заявки
+        supplies = order.get("supplies", [])
+        if supplies:
+            for supply in supplies:
+                # Дата поставки
+                arrival = (
+                    supply.get("arrival_date") or
+                    supply.get("planned_arrival_date") or
+                    supply.get("supply_date") or ""
+                )[:10]
+
+                # Склад назначения (новый формат — кластер, старый — warehouse)
+                cluster  = supply.get("cluster", {})
+                wh       = supply.get("warehouse", supply.get("destination_warehouse", {}))
+                dest     = (
+                    cluster.get("name") or cluster.get("cluster_name") or
+                    wh.get("name") or wh.get("warehouse_name") or "—"
+                ) if isinstance(cluster, dict) else "—"
+
+                lines.append(f"📦 Дата: {arrival or '—'} | Склад/Кластер: {dest}")
+
+                # Товары
+                items = supply.get("items", supply.get("bundles", []))
+                if items:
+                    for item in items:
+                        sku        = item.get("sku", "—")
+                        product_id = item.get("product_id")
+                        qty        = item.get("quantity", item.get("quantity_in_supply", "—"))
+                        name       = names.get(product_id, "—") if product_id else "—"
+                        lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
+                else:
+                    lines.append("  Товары: нет данных")
+        else:
+            lines.append("  Поставки: нет данных")
+
+        lines.append("")
 
     text_full = "\n".join(lines)
     chunks    = [text_full[i:i + 4000] for i in range(0, len(text_full), 4000)]
