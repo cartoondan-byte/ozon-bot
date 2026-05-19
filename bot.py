@@ -96,6 +96,20 @@ async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
     date_from = now.strftime("%Y-%m-%dT00:00:00Z")
     date_to   = (now + timedelta(days=5)).strftime("%Y-%m-%dT23:59:59Z")
 
+    # Все известные статусы заявок на поставку Ozon
+    all_states = [
+        "PLANNED",
+        "ACCEPTED",
+        "IN_PROGRESS",
+        "COMPLETED",
+        "CANCELLED",
+        "DRAFT",
+        "CONFIRMED",
+        "REJECTED",
+        "CREATED",
+        "APPROVED",
+    ]
+
     order_ids = []
     last_id   = ""
     limit     = 50
@@ -105,6 +119,7 @@ async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
             "filter": {
                 "supply_date_from": date_from,
                 "supply_date_to":   date_to,
+                "states":           all_states,
             },
             "sort_by": 1,
             "limit":   limit,
