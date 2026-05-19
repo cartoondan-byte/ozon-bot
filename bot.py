@@ -53,51 +53,33 @@ async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, ret
     raise Exception(f"Превышен лимит запросов к {url}")
 
 
-# ===== ЗАГРУЗКА НАЗВАНИЙ КЛАСТЕРОВ ПО ID =====
+# ===== ЗАГРУЗКА НАЗВАНИЙ КЛАСТЕРОВ =====
 async def resolve_cluster_names(cluster_ids: list[str]) -> None:
-    """
-    Пробует получить название кластера через /v1/cluster/info.
-    Незнакомые ID пробует пачкой — логирует ответ для анализа.
-    """
+    """Загружает все кластеры через /v1/cluster/list с CLUSTER_TYPE_OZON."""
     global CLUSTER_NAMES
-    unknown = [cid for cid in cluster_ids if cid not in CLUSTER_NAMES]
-    if not unknown:
+    if CLUSTER_NAMES:  # уже загружено
         return
-
-    async with aiohttp.ClientSession() as session:
-        for cid in unknown:
-            # Пробуем несколько вариантов endpoint и payload
-            found = False
-            for url, payload in [
-                (f"{OZON_API_URL}/v1/cluster/info",        {"cluster_id": int(cid)}),
-                (f"{OZON_API_URL}/v2/cluster/info",        {"cluster_id": int(cid)}),
-                (f"{OZON_API_URL}/v1/cluster/get",         {"cluster_id": int(cid)}),
-                (f"{OZON_API_URL}/v1/supply/cluster/info", {"macrolocal_cluster_id": cid}),
-            ]:
-                try:
-                    async with session.post(url, headers=ozon_headers(), json=payload) as resp:
-                        raw  = await resp.text()
-                        logging.info(f"cluster info [{cid}] {url} → {resp.status} | {raw[:200]}")
-                        if resp.status == 200:
-                            data = json.loads(raw)
-                            name = (
-                                data.get("name") or
-                                data.get("cluster_name") or
-                                data.get("title") or
-                                (data.get("cluster") or {}).get("name") or
-                                (data.get("result") or {}).get("name") or ""
-                            )
-                            if name:
-                                CLUSTER_NAMES[cid] = name
-                                logging.info(f"Кластер {cid} = {name}")
-                                found = True
-                                break
-                except Exception as e:
-                    logging.warning(f"cluster info {cid} {url}: {e}")
-
-            if not found:
-                # Оставляем числовой код — но логируем чтобы знать
-                logging.warning(f"Название кластера {cid} не найдено")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{OZON_API_URL}/v1/cluster/list",
+                headers=ozon_headers(),
+                json={"cluster_type": "CLUSTER_TYPE_OZON"}
+            ) as resp:
+                raw  = await resp.text()
+                logging.info(f"cluster/list OZON → {resp.status} | {raw[:400]}")
+                if resp.status == 200:
+                    data = json.loads(raw)
+                    for c in data.get("clusters", []):
+                        cid  = str(c.get("macrolocal_cluster_id", ""))
+                        name = c.get("name", "")
+                        if cid and name:
+                            CLUSTER_NAMES[cid] = name
+                    logging.info(f"Загружено кластеров: {len(CLUSTER_NAMES)}")
+                else:
+                    logging.warning(f"cluster/list вернул {resp.status}: {raw[:200]}")
+    except Exception as e:
+        logging.warning(f"Ошибка загрузки кластеров: {e}")
 
 
 def cluster_name(cluster_id: str) -> str:
