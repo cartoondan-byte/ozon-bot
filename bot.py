@@ -90,28 +90,35 @@ async def fetch_product_names(product_ids: list) -> dict:
     return result
 
 
-# ===== ШАГ 1: список order_id через /v3/supply-order/list =====
-async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
+# ===== ШАГ 1А: список ID через /v3/supply-order/list (sort_by = 1) =====
+async def fetch_order_ids_v3(session: aiohttp.ClientSession) -> list:
     order_ids = []
     last_id   = ""
     limit     = 50
 
+    # Пробуем sort_by = 1, 2, 3 пока один не сработает
+    working_sort_by = None
+    for sort_val in [1, 2, 3]:
+        test_payload = {"limit": 1, "sort_by": sort_val}
+        try:
+            data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", test_payload)
+            working_sort_by = sort_val
+            logging.info(f"✅ sort_by={sort_val} работает!")
+            break
+        except Exception as e:
+            logging.warning(f"sort_by={sort_val} не работает: {e}")
+
+    if working_sort_by is None:
+        raise Exception("Не удалось подобрать рабочее значение sort_by для /v3/supply-order/list")
+
     while True:
-        payload = {
-            "limit":    limit,
-            "sort_by":  "SUPPLY_DATE_ASC",  # обязательный enum, не может быть 0
-        }
+        payload = {"limit": limit, "sort_by": working_sort_by}
         if last_id:
             payload["last_id"] = last_id
 
-        try:
-            data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", payload)
-        except Exception as e:
-            logging.warning(f"supply-order/list ошибка: {e}")
-            break
-
-        # Ответ может быть списком int или списком dict
+        data  = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", payload)
         batch = data.get("order_ids", data.get("orders", []))
+
         if not batch:
             break
 
@@ -126,6 +133,40 @@ async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
         if not new_last_id or new_last_id == last_id or len(ids) < limit:
             break
         last_id = new_last_id
+
+    return order_ids
+
+
+# ===== ШАГ 1Б: fallback через /v2/supply-order/list =====
+async def fetch_order_ids_v2(session: aiohttp.ClientSession) -> list:
+    """Fallback на v2 если v3/list не работает"""
+    order_ids = []
+    last_id   = 0
+    limit     = 50
+
+    now      = datetime.now(MOSCOW_TZ)
+    date_from = now.strftime("%Y-%m-%dT00:00:00Z")
+    date_to   = (now + timedelta(days=5)).strftime("%Y-%m-%dT23:59:59Z")
+
+    while True:
+        payload = {
+            "filter": {
+                "supply_date_from": date_from,
+                "supply_date_to":   date_to,
+            },
+            "paging": {
+                "from_supply_order_id": last_id,
+                "limit": limit,
+            },
+        }
+        data  = await ozon_post(session, f"{OZON_API_URL}/v2/supply-order/list", payload)
+        batch = data.get("supply_orders", data.get("orders", []))
+
+        if not batch:
+            break
+
+        # v2 возвращает полные объекты заявок — возвращаем их сразу
+        return batch
 
     return order_ids
 
@@ -180,14 +221,26 @@ def filter_orders_by_date(orders: list[dict]) -> list[dict]:
 # ===== ОСНОВНАЯ ФУНКЦИЯ ПОСТАВОК =====
 async def fetch_supply_requests() -> list[dict]:
     async with aiohttp.ClientSession() as session:
-        order_ids = await fetch_supply_order_ids(session)
-        logging.info(f"Всего order_id получено: {len(order_ids)}")
 
-        if not order_ids:
-            return []
+        # Сначала пробуем v3/list → v3/get
+        try:
+            order_ids = await fetch_order_ids_v3(session)
+            logging.info(f"v3/list: получено order_id: {len(order_ids)}")
+            if order_ids:
+                orders = await fetch_supply_order_details(session, order_ids)
+                return filter_orders_by_date(orders)
+        except Exception as e:
+            logging.warning(f"v3/list не сработал: {e}, пробуем v2/list...")
 
-        orders = await fetch_supply_order_details(session, order_ids)
-        return filter_orders_by_date(orders)
+        # Fallback: v2/list (возвращает полные объекты с фильтром по дате)
+        try:
+            orders = await fetch_order_ids_v2(session)
+            logging.info(f"v2/list: получено заявок: {len(orders)}")
+            return orders
+        except Exception as e:
+            logging.warning(f"v2/list тоже не сработал: {e}")
+
+        return []
 
 
 # ===== ГЛАВНОЕ МЕНЮ =====
@@ -198,16 +251,14 @@ def main_menu() -> InlineKeyboardMarkup:
     ])
 
 
-# ===== СТАРТ: удаляем старые сообщения и показываем меню =====
+# ===== СТАРТ: удаляем старые сообщения =====
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    # Удаляем сообщение пользователя /start
     try:
         await message.delete()
     except Exception:
         pass
 
-    # Удаляем до 50 предыдущих сообщений бота в чате
     chat_id    = message.chat.id
     message_id = message.message_id
 
@@ -215,7 +266,7 @@ async def cmd_start(message: types.Message):
         try:
             await bot.delete_message(chat_id=chat_id, message_id=mid)
         except Exception:
-            pass  # Пропускаем если уже удалено или нет доступа
+            pass
 
     await bot.send_message(
         chat_id=chat_id,
@@ -289,7 +340,6 @@ async def handle_show_supplies(call: CallbackQuery):
     except Exception:
         names = {}
 
-    # Формируем текст
     lines = [f"🚚 Заявок на ближайшие 5 дней: {len(orders)}\n"]
 
     for order in orders:
