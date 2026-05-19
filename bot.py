@@ -291,22 +291,7 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
     # Старые заявки → supplies[0].storage_warehouse.name (склад хранения)
     groups_map: dict = {}
 
-    # Диагностика — полный supplies[0] первой заявки
-    if df_orders:
-        import json as _json
-        o0 = df_orders[0]
-        s0 = (o0.get("supplies") or [{}])[0]
-        logger.info(f"ДИАГНОСТИКА supplies[0] полный: {_json.dumps(s0, ensure_ascii=False, default=str)}")
-        # Также логируем несколько заявок чтобы найти ту у которой есть macrolocal_cluster_id
-        for o in df_orders[:50]:
-            s = (o.get("supplies") or [{}])[0]
-            cid = s.get("macrolocal_cluster_id")
-            if cid:
-                logger.info(f"НАЙДЕН macrolocal_cluster_id={cid} в заявке {o.get('order_number')}")
-                logger.info(f"supplies полный: {_json.dumps(s, ensure_ascii=False, default=str)}")
-                break
-        else:
-            logger.info("ДИАГНОСТИКА: macrolocal_cluster_id не найден в первых 50 заявках!")
+
 
     for order in df_orders:
         supplies = order.get("supplies", [])
@@ -394,11 +379,6 @@ async def load_clusters_data_filling(user_id: int, force_refresh: bool = False):
 
     # Сортируем по убыванию количества заявок
     cluster_list.sort(key=lambda x: len(x["orders"]), reverse=True)
-
-    # Диагностика
-    for g in cluster_list[:5]:
-        logger.info(f"Группа: type={g['type']} name={g['display_name']} orders={len(g['orders'])}")
-    logger.info(f"groups_map keys: {list(groups_map.keys())[:10]}")
 
     cluster_cache[user_id] = cluster_list
     cluster_cache_time[user_id] = datetime.now()
