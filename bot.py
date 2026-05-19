@@ -68,7 +68,6 @@ async def fetch_all_skus() -> list[dict]:
 
 # ===== ПОЛУЧЕНИЕ НАЗВАНИЙ ТОВАРОВ ПО product_id =====
 async def fetch_product_names(product_ids: list[int]) -> dict[int, str]:
-    """Возвращает словарь {product_id: name}"""
     result     = {}
     chunk_size = 1000
 
@@ -96,40 +95,65 @@ async def fetch_product_names(product_ids: list[int]) -> dict[int, str]:
     return result
 
 
-# ===== ПОЛУЧЕНИЕ ЗАЯВОК НА ПОСТАВКУ =====
+# ===== ПОЛУЧЕНИЕ ЗАЯВОК НА ПОСТАВКУ (v3) =====
 async def fetch_supply_requests() -> list[dict]:
     """
-    Получает заявки на поставку на ближайшие 5 дней.
-    Использует /v1/supply-order/list
+    Получает заявки на поставку на ближайшие 5 дней через /v3/supply-order/get.
+    Фильтрует по supply_date на стороне клиента, т.к. v3 принимает order_ids или last_id+limit.
     """
-    now       = datetime.now(MOSCOW_TZ)
-    date_from = now.strftime("%Y-%m-%dT00:00:00Z")
-    date_to   = (now + timedelta(days=5)).strftime("%Y-%m-%dT23:59:59Z")
+    now      = datetime.now(MOSCOW_TZ)
+    date_to  = now + timedelta(days=5)
 
-    payload = {
-        "filter": {
-            "supply_date_from": date_from,
-            "supply_date_to":   date_to,
-        },
-        "paging": {
-            "from_supply_order_id": 0,
-            "limit": 100,
-        },
-    }
+    orders   = []
+    last_id  = 0
+    limit    = 50
 
     async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{OZON_API_URL}/v1/supply-order/list",
-            headers=ozon_headers(),
-            json=payload,
-        ) as resp:
-            raw = await resp.text()
-            logging.info(f"Ozon supply status: {resp.status} | body: {raw[:500]}")
-            if resp.status != 200:
-                raise Exception(f"HTTP {resp.status}: {raw[:300]}")
-            data = json.loads(raw)
+        while True:
+            payload = {
+                "last_id": last_id,
+                "limit":   limit,
+            }
+            async with session.post(
+                f"{OZON_API_URL}/v3/supply-order/get",
+                headers=ozon_headers(),
+                json=payload,
+            ) as resp:
+                raw = await resp.text()
+                logging.info(f"Ozon supply v3 status: {resp.status} | body: {raw[:500]}")
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status}: {raw[:300]}")
+                data = json.loads(raw)
 
-    return data.get("supply_orders", [])
+            batch = data.get("orders", [])
+            if not batch:
+                break
+
+            for order in batch:
+                # Дата поставки может быть в supplies[].arrival_date или supply_date
+                supply_date_str = None
+                supplies = order.get("supplies", [])
+                if supplies:
+                    supply_date_str = supplies[0].get("arrival_date", "")
+                if not supply_date_str:
+                    supply_date_str = order.get("supply_date", "")
+
+                if supply_date_str:
+                    try:
+                        # Парсим дату (формат: 2026-05-21T00:00:00Z или 2026-05-21)
+                        dt_str = supply_date_str[:10]
+                        order_dt = datetime.strptime(dt_str, "%Y-%m-%d")
+                        order_dt = MOSCOW_TZ.localize(order_dt)
+                        if now.replace(hour=0, minute=0, second=0, microsecond=0) <= order_dt <= date_to:
+                            orders.append(order)
+                    except Exception:
+                        pass
+
+            last_id = data.get("last_id", 0)
+            if not last_id or len(batch) < limit:
+                break
+
+    return orders
 
 
 # ===== ГЛАВНОЕ МЕНЮ =====
@@ -203,10 +227,11 @@ async def handle_show_supplies(call: CallbackQuery):
     # Собираем все product_id для получения названий
     all_product_ids = []
     for order in orders:
-        for item in order.get("items", []):
-            pid = item.get("product_id")
-            if pid:
-                all_product_ids.append(pid)
+        for supply in order.get("supplies", []):
+            for item in supply.get("items", []):
+                pid = item.get("product_id")
+                if pid:
+                    all_product_ids.append(pid)
 
     try:
         names = await fetch_product_names(list(set(all_product_ids)))
@@ -218,22 +243,25 @@ async def handle_show_supplies(call: CallbackQuery):
     lines.append(f"🚚 Заявок на ближайшие 5 дней: {len(orders)}\n")
 
     for order in orders:
-        order_id    = order.get("supply_order_id", "—")
-        status      = order.get("status", "—")
-        supply_date = order.get("supply_date", "")[:10]
+        order_id = order.get("order_id", "—")
+        status   = order.get("state", order.get("status", "—"))
 
         lines.append("━━━━━━━━━━━━━━━━━━")
         lines.append(f"📋 Заявка #{order_id}")
-        lines.append(f"📅 Дата: {supply_date}")
         lines.append(f"🔖 Статус: {status}")
-        lines.append("Товары:")
 
-        for item in order.get("items", []):
-            sku        = item.get("sku", item.get("product_id", "—"))
-            product_id = item.get("product_id")
-            qty        = item.get("quantity", "—")
-            name       = names.get(product_id, "—") if product_id else "—"
-            lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
+        for supply in order.get("supplies", []):
+            arrival = supply.get("arrival_date", "")[:10]
+            warehouse = supply.get("warehouse_name", supply.get("warehouse_id", "—"))
+            lines.append(f"📅 Дата поставки: {arrival} | Склад: {warehouse}")
+            lines.append("Товары:")
+
+            for item in supply.get("items", []):
+                sku        = item.get("sku", item.get("product_id", "—"))
+                product_id = item.get("product_id")
+                qty        = item.get("quantity", "—")
+                name       = names.get(product_id, "—") if product_id else "—"
+                lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
 
         lines.append("")
 
