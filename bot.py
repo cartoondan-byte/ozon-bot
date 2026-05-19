@@ -30,7 +30,17 @@ def ozon_headers() -> dict:
     }
 
 
-# ===== ПОЛУЧЕНИЕ SKU С OZON =====
+# ===== ВСПОМОГАТЕЛЬНАЯ: POST-запрос с логированием =====
+async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
+    async with session.post(url, headers=ozon_headers(), json=payload) as resp:
+        raw = await resp.text()
+        logging.info(f"POST {url} → {resp.status} | {raw[:400]}")
+        if resp.status != 200:
+            raise Exception(f"HTTP {resp.status} [{url}]: {raw[:300]}")
+        return json.loads(raw)
+
+
+# ===== ПОЛУЧЕНИЕ ВСЕХ SKU =====
 async def fetch_all_skus() -> list[dict]:
     skus    = []
     last_id = ""
@@ -39,21 +49,11 @@ async def fetch_all_skus() -> list[dict]:
     async with aiohttp.ClientSession() as session:
         while True:
             payload = {
-                "filter": {"visibility": "ALL"},
+                "filter":  {"visibility": "ALL"},
                 "last_id": last_id,
                 "limit":   limit,
             }
-            async with session.post(
-                f"{OZON_API_URL}/v3/product/list",
-                headers=ozon_headers(),
-                json=payload,
-            ) as resp:
-                raw = await resp.text()
-                logging.info(f"Ozon SKU status: {resp.status} | body: {raw[:500]}")
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}: {raw[:300]}")
-                data = json.loads(raw)
-
+            data    = await ozon_post(session, f"{OZON_API_URL}/v3/product/list", payload)
             items   = data.get("result", {}).get("items", [])
             last_id = data.get("result", {}).get("last_id", "")
 
@@ -66,7 +66,7 @@ async def fetch_all_skus() -> list[dict]:
     return skus
 
 
-# ===== ПОЛУЧЕНИЕ НАЗВАНИЙ ТОВАРОВ ПО product_id =====
+# ===== ПОЛУЧЕНИЕ НАЗВАНИЙ ТОВАРОВ =====
 async def fetch_product_names(product_ids: list[int]) -> dict[int, str]:
     result     = {}
     chunk_size = 1000
@@ -74,86 +74,124 @@ async def fetch_product_names(product_ids: list[int]) -> dict[int, str]:
     async with aiohttp.ClientSession() as session:
         for i in range(0, len(product_ids), chunk_size):
             chunk = product_ids[i:i + chunk_size]
-            payload = {"product_id": chunk}
-            async with session.post(
-                f"{OZON_API_URL}/v2/product/info/list",
-                headers=ozon_headers(),
-                json=payload,
-            ) as resp:
-                raw = await resp.text()
-                logging.info(f"Ozon product info status: {resp.status} | body: {raw[:300]}")
-                if resp.status != 200:
-                    continue
-                data = json.loads(raw)
-
-            for item in data.get("result", {}).get("items", []):
-                pid  = item.get("id")
-                name = item.get("name", "—")
-                if pid:
-                    result[pid] = name
+            try:
+                data = await ozon_post(
+                    session,
+                    f"{OZON_API_URL}/v2/product/info/list",
+                    {"product_id": chunk}
+                )
+                for item in data.get("result", {}).get("items", []):
+                    pid = item.get("id")
+                    if pid:
+                        result[pid] = item.get("name", "—")
+            except Exception as e:
+                logging.warning(f"Не удалось получить названия товаров: {e}")
 
     return result
 
 
-# ===== ПОЛУЧЕНИЕ ЗАЯВОК НА ПОСТАВКУ (v3) =====
-async def fetch_supply_requests() -> list[dict]:
+# ===== ШАГ 1: получить список order_id через /v3/supply-order/list =====
+async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list[int]:
     """
-    Получает заявки на поставку на ближайшие 5 дней через /v3/supply-order/get.
-    Фильтрует по supply_date на стороне клиента, т.к. v3 принимает order_ids или last_id+limit.
+    Получает все order_id заявок на поставку через /v3/supply-order/list.
+    Фильтр по дате применяем на стороне бота.
     """
-    now      = datetime.now(MOSCOW_TZ)
-    date_to  = now + timedelta(days=5)
+    order_ids = []
+    last_id   = 0
+    limit     = 50
 
-    orders   = []
-    last_id  = 0
-    limit    = 50
+    while True:
+        payload = {
+            "last_id": last_id,
+            "limit":   limit,
+        }
+        try:
+            data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", payload)
+        except Exception as e:
+            logging.warning(f"supply-order/list ошибка: {e}")
+            break
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            payload = {
-                "last_id": last_id,
-                "limit":   limit,
-            }
-            async with session.post(
+        batch = data.get("order_ids", data.get("orders", []))
+
+        # Поддержка двух форматов ответа: список int или список dict
+        if batch and isinstance(batch[0], dict):
+            ids = [o.get("order_id") for o in batch if o.get("order_id")]
+        else:
+            ids = [oid for oid in batch if oid]
+
+        order_ids.extend(ids)
+
+        new_last_id = data.get("last_id", 0)
+        if not new_last_id or new_last_id == last_id or len(ids) < limit:
+            break
+        last_id = new_last_id
+
+    return order_ids
+
+
+# ===== ШАГ 2: получить детали заявок через /v3/supply-order/get =====
+async def fetch_supply_order_details(
+    session: aiohttp.ClientSession,
+    order_ids: list[int]
+) -> list[dict]:
+    orders     = []
+    chunk_size = 50  # API принимает 1–50 за раз
+
+    for i in range(0, len(order_ids), chunk_size):
+        chunk = order_ids[i:i + chunk_size]
+        try:
+            data = await ozon_post(
+                session,
                 f"{OZON_API_URL}/v3/supply-order/get",
-                headers=ozon_headers(),
-                json=payload,
-            ) as resp:
-                raw = await resp.text()
-                logging.info(f"Ozon supply v3 status: {resp.status} | body: {raw[:500]}")
-                if resp.status != 200:
-                    raise Exception(f"HTTP {resp.status}: {raw[:300]}")
-                data = json.loads(raw)
-
-            batch = data.get("orders", [])
-            if not batch:
-                break
-
-            for order in batch:
-                # Дата поставки может быть в supplies[].arrival_date или supply_date
-                supply_date_str = None
-                supplies = order.get("supplies", [])
-                if supplies:
-                    supply_date_str = supplies[0].get("arrival_date", "")
-                if not supply_date_str:
-                    supply_date_str = order.get("supply_date", "")
-
-                if supply_date_str:
-                    try:
-                        # Парсим дату (формат: 2026-05-21T00:00:00Z или 2026-05-21)
-                        dt_str = supply_date_str[:10]
-                        order_dt = datetime.strptime(dt_str, "%Y-%m-%d")
-                        order_dt = MOSCOW_TZ.localize(order_dt)
-                        if now.replace(hour=0, minute=0, second=0, microsecond=0) <= order_dt <= date_to:
-                            orders.append(order)
-                    except Exception:
-                        pass
-
-            last_id = data.get("last_id", 0)
-            if not last_id or len(batch) < limit:
-                break
+                {"order_ids": chunk}
+            )
+            orders.extend(data.get("orders", []))
+        except Exception as e:
+            logging.warning(f"supply-order/get chunk {chunk}: {e}")
 
     return orders
+
+
+# ===== ФИЛЬТР: заявки на ближайшие 5 дней =====
+def filter_orders_by_date(orders: list[dict]) -> list[dict]:
+    now      = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    date_to  = now + timedelta(days=5)
+    filtered = []
+
+    for order in orders:
+        # Ищем дату поставки в supplies[].arrival_date или supply_date
+        supply_date_str = order.get("supply_date", "")
+        if not supply_date_str:
+            supplies = order.get("supplies", [])
+            if supplies:
+                supply_date_str = supplies[0].get("arrival_date", "")
+
+        if supply_date_str:
+            try:
+                dt = datetime.strptime(supply_date_str[:10], "%Y-%m-%d")
+                dt = MOSCOW_TZ.localize(dt)
+                if now <= dt <= date_to:
+                    filtered.append(order)
+            except Exception:
+                pass
+        else:
+            # Если дата не указана — включаем на всякий случай
+            filtered.append(order)
+
+    return filtered
+
+
+# ===== ОСНОВНАЯ ФУНКЦИЯ ПОСТАВОК =====
+async def fetch_supply_requests() -> list[dict]:
+    async with aiohttp.ClientSession() as session:
+        order_ids = await fetch_supply_order_ids(session)
+        logging.info(f"Всего order_id получено: {len(order_ids)}")
+
+        if not order_ids:
+            return []
+
+        orders = await fetch_supply_order_details(session, order_ids)
+        return filter_orders_by_date(orders)
 
 
 # ===== ГЛАВНОЕ МЕНЮ =====
@@ -167,10 +205,7 @@ def main_menu() -> InlineKeyboardMarkup:
 # ===== СТАРТ =====
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "Привет! Выбери действие:",
-        reply_markup=main_menu()
-    )
+    await message.answer("Привет! Выбери действие:", reply_markup=main_menu())
 
 
 # ===== КНОПКА: ВСЕ SKU =====
@@ -224,7 +259,7 @@ async def handle_show_supplies(call: CallbackQuery):
         )
         return
 
-    # Собираем все product_id для получения названий
+    # Собираем product_id для названий
     all_product_ids = []
     for order in orders:
         for supply in order.get("supplies", []):
@@ -239,8 +274,7 @@ async def handle_show_supplies(call: CallbackQuery):
         names = {}
 
     # Формируем текст
-    lines = []
-    lines.append(f"🚚 Заявок на ближайшие 5 дней: {len(orders)}\n")
+    lines = [f"🚚 Заявок на ближайшие 5 дней: {len(orders)}\n"]
 
     for order in orders:
         order_id = order.get("order_id", "—")
@@ -251,9 +285,9 @@ async def handle_show_supplies(call: CallbackQuery):
         lines.append(f"🔖 Статус: {status}")
 
         for supply in order.get("supplies", []):
-            arrival = supply.get("arrival_date", "")[:10]
+            arrival   = supply.get("arrival_date", "")[:10]
             warehouse = supply.get("warehouse_name", supply.get("warehouse_id", "—"))
-            lines.append(f"📅 Дата поставки: {arrival} | Склад: {warehouse}")
+            lines.append(f"📅 Дата: {arrival} | Склад: {warehouse}")
             lines.append("Товары:")
 
             for item in supply.get("items", []):
