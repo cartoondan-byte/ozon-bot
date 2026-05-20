@@ -61,12 +61,12 @@ def ozon_headers() -> dict:
 
 
 # ===== POST с retry на 429 =====
-async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, retries: int = 5) -> dict:
+async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, retries: int = 7) -> dict:
     for attempt in range(retries):
         async with session.post(url, headers=ozon_headers(), json=payload) as resp:
             raw = await resp.text()
             if resp.status == 429:
-                wait = 1.5 * (attempt + 1)
+                wait = 3.0 * (attempt + 1)
                 logging.warning(f"429 rate limit, жду {wait}с...")
                 await asyncio.sleep(wait)
                 continue
@@ -555,21 +555,9 @@ async def fetch_super_skus(session: aiohttp.ClientSession) -> list[dict]:
                 )
                 for item in info_data.get("items", []):
                     name = item.get("name", "") or ""
-                    # ДЕБАГ: полный дамп товара 701201572 (Super-товар)
-                    if item.get("offer_id") == "701201572":
-                        logging.info(f"SUPER_FULL: {json.dumps(item, ensure_ascii=False)}")
-                    # Ищем Super-товары — проверяем все возможные поля
-                    item_str = json.dumps(item, ensure_ascii=False).lower()
-                    is_super = (
-                        '"super"' in item_str or
-                        "'super'" in item_str or
-                        '"is_super": true' in item_str or
-                        '"super": true' in item_str or
-                        '"super_product"' in item_str or
-                        SUPER_PRODUCT_TAG.lower() in name.lower()
-                    )
-                    if is_super:
-                        sku = item.get("sku") or item.get("fbo_sku")
+                    # Ищем Super-товары по полю is_super
+                    if item.get("is_super"):
+                        sku = item.get("sku")
                         if not sku:
                             for src in item.get("sources", []):
                                 if src.get("sku"):
@@ -674,6 +662,7 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
         if supply_type == "CREATE_TYPE_CROSSDOCK":
             payload["drop_off_point_warehouse_id"] = drop_off_wh_id
 
+        await asyncio.sleep(2)  # пауза перед draft/create чтобы избежать 429
         resp = await ozon_post(session, f"{OZON_API_URL}/v1/draft/create", payload)
         operation_id = resp.get("operation_id")
         if not operation_id:
