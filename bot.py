@@ -28,6 +28,21 @@ CLUSTER_NAMES: dict = {}
 _cache: dict = {}
 
 
+# ===== АДАПТИВНЫЙ RATE LIMITER =====
+_bundle_semaphore = asyncio.Semaphore(3)   # не более 3 параллельных bundle-запросов
+_bundle_delay     = 0.15                   # начальная задержка между запросами (сек)
+_bundle_delay_min = 0.05
+_bundle_delay_max = 2.0
+
+def _adjust_delay(success: bool) -> None:
+    global _bundle_delay
+    if success:
+        _bundle_delay = max(_bundle_delay_min, _bundle_delay * 0.9)   # -10% при успехе
+    else:
+        _bundle_delay = min(_bundle_delay_max, _bundle_delay * 1.5)   # +50% при 429
+    logging.debug(f"bundle_delay={_bundle_delay:.3f}s")
+
+
 # ===== ЗАГОЛОВКИ =====
 def ozon_headers() -> dict:
     return {
@@ -145,16 +160,43 @@ async def fetch_supply_order_details(session: aiohttp.ClientSession, order_ids: 
 
 
 # ===== ТОВАРЫ ИЗ БАНДЛОВ =====
+async def _fetch_one_bundle(session: aiohttp.ClientSession, bid: str) -> tuple[str, list]:
+    """Загрузить один bundle с семафором и адаптивной задержкой."""
+    global _bundle_delay
+    async with _bundle_semaphore:
+        await asyncio.sleep(_bundle_delay)
+        for attempt in range(4):
+            try:
+                async with session.post(
+                    f"{OZON_API_URL}/v1/supply-order/bundle",
+                    headers=ozon_headers(),
+                    json={"bundle_ids": [bid], "last_id": "", "limit": 100}
+                ) as resp:
+                    if resp.status == 429:
+                        _adjust_delay(False)
+                        wait = _bundle_delay * (attempt + 1)
+                        logging.warning(f"bundle 429, жду {wait:.2f}с (attempt {attempt+1})")
+                        await asyncio.sleep(wait)
+                        continue
+                    raw = await resp.text()
+                    if resp.status != 200:
+                        logging.warning(f"bundle {bid[:8]} HTTP {resp.status}")
+                        return bid, []
+                    _adjust_delay(True)
+                    data = json.loads(raw)
+                    logging.info(f"POST {OZON_API_URL}/v1/supply-order/bundle → {resp.status} | {raw[:200]}")
+                    return bid, data.get("items", [])
+            except Exception as e:
+                logging.warning(f"bundle {bid[:8]} attempt {attempt}: {e}")
+                await asyncio.sleep(_bundle_delay)
+        return bid, []
+
+
 async def fetch_bundle_items(session: aiohttp.ClientSession, bundle_ids: list) -> dict:
-    result = {}
-    for bid in bundle_ids:
-        try:
-            data  = await ozon_post(session, f"{OZON_API_URL}/v1/supply-order/bundle",
-                                    {"bundle_ids": [bid], "last_id": "", "limit": 100})
-            result[bid] = data.get("items", [])
-        except Exception as e:
-            logging.warning(f"bundle {bid}: {e}")
-    return result
+    """Параллельная загрузка бандлов (до 3 одновременно) с адаптивной задержкой."""
+    tasks = [_fetch_one_bundle(session, bid) for bid in bundle_ids]
+    pairs = await asyncio.gather(*tasks)
+    return dict(pairs)
 
 
 # ===== КЛЮЧ И МЕТКА НАЗНАЧЕНИЯ =====
@@ -217,7 +259,7 @@ async def reschedule_near_orders() -> str:
         )
 
     async with aiohttp.ClientSession() as session:
-        for order in near_orders:
+        for order in near_orders[:5]:  # ТЕСТ: только первые 5
             order_id  = order.get("order_id")
             order_num = order.get("order_number", str(order_id))
             try:
@@ -242,13 +284,59 @@ async def reschedule_near_orders() -> str:
                 logging.info(f"timeslot/update #{order_id} → {resp}")
 
                 errs = resp.get("errors") or []
-                if not errs:
+                op_id = resp.get("operation_id")
+                success = not errs
+
+                # Если update принят — проверяем финальный статус
+                if op_id and not errs:
+                    await asyncio.sleep(2)
+                    try:
+                        status_resp = await ozon_post(
+                            session,
+                            f"{OZON_API_URL}/v1/supply-order/timeslot/status",
+                            {"supply_order_id": order_id},
+                            retries=3
+                        )
+                        logging.info(f"timeslot/status #{order_id} → {status_resp}")
+                        if status_resp.get("status") != "STATUS_SUCCESS":
+                            success = False
+                    except Exception:
+                        pass
+
+                if success:
                     results.append(
                         f"✅ #{order_num}\n"
                         f"   {cur_str} → {target_date.strftime('%d.%m.%Y')} (+{days_ahead}д)"
                     )
                 else:
-                    errors.append(f"❌ #{order_num}: {errs}")
+                    # Fallback: фиксированные +15 дней от сегодня
+                    fallback_date = today + timedelta(days=15)
+                    fb_from = f"{fallback_date.strftime('%Y-%m-%d')}T16:00:00Z"
+                    fb_to   = f"{fallback_date.strftime('%Y-%m-%d')}T17:00:00Z"
+                    try:
+                        fb_resp = await ozon_post(
+                            session,
+                            f"{OZON_API_URL}/v1/supply-order/timeslot/update",
+                            {"supply_order_id": order_id, "timeslot": {"from": fb_from, "to": fb_to}},
+                            retries=3
+                        )
+                        logging.info(f"timeslot/fallback #{order_id} → {fb_resp}")
+                        await asyncio.sleep(2)
+                        fb_status = await ozon_post(
+                            session,
+                            f"{OZON_API_URL}/v1/supply-order/timeslot/status",
+                            {"supply_order_id": order_id},
+                            retries=3
+                        )
+                        if fb_status.get("status") == "STATUS_SUCCESS":
+                            results.append(
+                                f"⚠️ #{order_num} (fallback +15д)\n"
+                                f"   {cur_str} → {fallback_date.strftime('%d.%m.%Y')}"
+                            )
+                        else:
+                            errors.append(f"❌ #{order_num}: fallback тоже не удался: {fb_status.get('errors')}")
+                    except Exception as fb_e:
+                        errors.append(f"❌ #{order_num}: {errs} | fallback: {str(fb_e)[:80]}")
             except Exception as e:
                 logging.exception(f"reschedule #{order_id}: {e}")
                 errors.append(f"❌ #{order_num}: {str(e)[:100]}")
