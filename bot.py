@@ -270,6 +270,132 @@ async def load_all_orders() -> dict:
     return grouped
 
 
+# ===== ПЕРЕНОС БЛИЖАЙШИХ ЗАЯВОК =====
+async def reschedule_near_orders() -> str:
+    """Переносит заявки DATA_FILLING с датой поставки в ближайшие 5 дней
+    на случайную дату от +15 до +27 дней от сегодня, слот 19:00-20:00 МСК (16:00-17:00 UTC)."""
+    today    = datetime.now(MOSCOW_TZ).date()
+    date_to  = today + timedelta(days=5)
+    results, errors = [], []
+
+    async with aiohttp.ClientSession() as session:
+        order_ids = await fetch_supply_order_ids(session)
+        if not order_ids:
+            return "📭 Нет заявок со статусом «Заполнение данных»."
+
+        orders = await fetch_supply_order_details(session, order_ids)
+
+    near_orders = []
+    for order in orders:
+        ts      = order.get("timeslot", {}).get("timeslot", {})
+        ts_from = ts.get("from", "")
+        if not ts_from:
+            continue
+        try:
+            dt = datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S")
+            dt = MOSCOW_TZ.localize(dt)
+            if today <= dt.date() <= date_to:
+                near_orders.append(order)
+        except Exception:
+            continue
+
+    if not near_orders:
+        return (
+            f"📭 Заявок DATA_FILLING с датой поставки в ближайшие 5 дней нет.\n"
+            f"Всего DATA_FILLING заявок: {len(orders)}"
+        )
+
+    async with aiohttp.ClientSession() as session:
+        for order in near_orders[:5]:
+            order_id  = order.get("order_id")
+            order_num = order.get("order_number", str(order_id))
+            try:
+                ts_from = order["timeslot"]["timeslot"]["from"]
+                cur_dt  = MOSCOW_TZ.localize(datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S"))
+                cur_str = cur_dt.strftime("%d.%m.%Y")
+
+                days_ahead  = random.randint(15, 27)
+                target_date = today + timedelta(days=days_ahead)
+                time_from = f"{target_date.strftime('%Y-%m-%d')}T16:00:00Z"
+                time_to   = f"{target_date.strftime('%Y-%m-%d')}T17:00:00Z"
+
+                resp = await ozon_post(
+                    session,
+                    f"{OZON_API_URL}/v1/supply-order/timeslot/update",
+                    {"supply_order_id": order_id, "timeslot": {"from": time_from, "to": time_to}},
+                    retries=3
+                )
+                logging.info(f"timeslot/update #{order_id} → {resp}")
+
+                errs = resp.get("errors") or []
+                op_id = resp.get("operation_id")
+                success = not errs
+
+                if op_id and not errs:
+                    await asyncio.sleep(2)
+                    try:
+                        status_resp = await ozon_post(
+                            session,
+                            f"{OZON_API_URL}/v1/supply-order/timeslot/status",
+                            {"supply_order_id": order_id},
+                            retries=3
+                        )
+                        logging.info(f"timeslot/status #{order_id} → {status_resp}")
+                        if status_resp.get("status") != "STATUS_SUCCESS":
+                            success = False
+                    except Exception:
+                        pass
+
+                if success:
+                    results.append(
+                        f"✅ #{order_num}\n"
+                        f"   {cur_str} → {target_date.strftime('%d.%m.%Y')} (+{days_ahead}д)"
+                    )
+                else:
+                    fallback_date = today + timedelta(days=15)
+                    fb_from = f"{fallback_date.strftime('%Y-%m-%d')}T16:00:00Z"
+                    fb_to   = f"{fallback_date.strftime('%Y-%m-%d')}T17:00:00Z"
+                    try:
+                        fb_resp = await ozon_post(
+                            session,
+                            f"{OZON_API_URL}/v1/supply-order/timeslot/update",
+                            {"supply_order_id": order_id, "timeslot": {"from": fb_from, "to": fb_to}},
+                            retries=3
+                        )
+                        logging.info(f"timeslot/fallback #{order_id} → {fb_resp}")
+                        await asyncio.sleep(2)
+                        fb_status = await ozon_post(
+                            session,
+                            f"{OZON_API_URL}/v1/supply-order/timeslot/status",
+                            {"supply_order_id": order_id},
+                            retries=3
+                        )
+                        if fb_status.get("status") == "STATUS_SUCCESS":
+                            results.append(
+                                f"⚠️ #{order_num} (fallback +15д)\n"
+                                f"   {cur_str} → {fallback_date.strftime('%d.%m.%Y')}"
+                            )
+                        else:
+                            errors.append(f"❌ #{order_num}: fallback тоже не удался: {fb_status.get('errors')}")
+                    except Exception as fb_e:
+                        errors.append(f"❌ #{order_num}: {errs} | fallback: {str(fb_e)[:80]}")
+            except Exception as e:
+                logging.exception(f"reschedule #{order_id}: {e}")
+                errors.append(f"❌ #{order_num}: {str(e)[:100]}")
+
+    lines = [
+        f"🔄 Перенос ближайших заявок DATA_FILLING",
+        f"Найдено: {len(near_orders)} заявок (дата поставки сегодня–{date_to.strftime('%d.%m')})",
+        f"Целевое время: 19:00–20:00 МСК\n",
+    ]
+    if results:
+        lines.extend(results)
+    if errors:
+        lines.append("\nОшибки:")
+        lines.extend(errors)
+    return "\n".join(lines)
+
+
 # ===== ПЕРЕНОС ТАЙМСЛОТОВ =====
 async def reschedule_near_orders(grouped: dict) -> str:
     moscow_tz = MOSCOW_TZ
@@ -1009,6 +1135,27 @@ async def handle_confirm_reschedule(call: CallbackQuery):
         await call.message.answer("⬆️ Готово!", reply_markup=back_kb)
     else:
         await call.message.edit_text(result, reply_markup=back_kb)
+
+
+# ===== ПЕРЕНОС ЗАЯВОК (callback) =====
+@dp.callback_query(F.data == "do_reschedule")
+async def handle_do_reschedule(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text(
+        "⏳ Ищу заявки с датой поставки в ближайшие 5 дней и переношу...\n"
+        "Это может занять до 1 минуты."
+    )
+    try:
+        result = await reschedule_near_orders()
+    except Exception as e:
+        result = f"❌ Ошибка: {e}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Запустить снова",  callback_data="do_reschedule")],
+        [InlineKeyboardButton(text="🏠 Главное меню",     callback_data="main_menu")],
+    ])
+    if len(result) > 4000:
+        result = result[:4000] + "\n...(обрезано)"
+    await call.message.edit_text(result, reply_markup=kb)
 
 
 # ===== ЗАЯВКИ — ПОКАЗАТЬ СКЛАДЫ/КЛАСТЕРЫ =====
