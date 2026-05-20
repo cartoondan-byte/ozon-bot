@@ -555,13 +555,29 @@ async def fetch_super_skus(session: aiohttp.ClientSession) -> list[dict]:
                 )
                 for item in info_data.get("items", []):
                     name = item.get("name", "") or ""
-                    # ДЕБАГ: выводим все поля чтобы найти где тег Super
-                    logging.info(f"PRODUCT_DEBUG: {json.dumps(item, ensure_ascii=False)[:800]}")
-                    # Ищем Super-товары по названию (временно, пока не найдём правильное поле)
-                    if SUPER_PRODUCT_TAG.lower() in name.lower():
+                    # ДЕБАГ: полный дамп товара 701201572 (Super-товар)
+                    if item.get("offer_id") == "701201572":
+                        logging.info(f"SUPER_FULL: {json.dumps(item, ensure_ascii=False)}")
+                    # Ищем Super-товары — проверяем все возможные поля
+                    item_str = json.dumps(item, ensure_ascii=False).lower()
+                    is_super = (
+                        '"super"' in item_str or
+                        "'super'" in item_str or
+                        '"is_super": true' in item_str or
+                        '"super": true' in item_str or
+                        '"super_product"' in item_str or
+                        SUPER_PRODUCT_TAG.lower() in name.lower()
+                    )
+                    if is_super:
                         sku = item.get("sku") or item.get("fbo_sku")
+                        if not sku:
+                            for src in item.get("sources", []):
+                                if src.get("sku"):
+                                    sku = src["sku"]
+                                    break
                         if sku:
                             skus.append({"sku": int(sku), "name": name})
+                            logging.info(f"SUPER найден: sku={sku} name={name[:60]}")
             except Exception as e:
                 logging.warning(f"product/info/list batch: {e}")
 
