@@ -1,49 +1,45 @@
+"""
+ТЕСТ: Создание одной заявки на поставку в кластер Воронеж
+==========================================================
+Workflow:
+  1. /v1/cluster/list           → найти cluster_id Воронежа
+  2. /v1/warehouse/fbo/list     → найти warehouse_id точки СТАВРОПОЛЬ_АППЗ_2
+  3. /v1/draft/create           → создать черновик (1 SKU, 5 шт)
+  4. /v1/draft/create/info      → polling до CALCULATION_STATUS_SUCCESS → draft_id + warehouse_id
+  5. /v1/draft/timeslot/info    → получить доступные слоты (+14..+19 дней)
+  6. /v1/draft/supply/create    → создать заявку (слот 19-20 МСК или 18-19 МСК)
+  7. /v1/draft/supply/create/status → polling до Success/Failed
+
+Запуск:
+  OZON_CLIENT_ID=xxx OZON_API_KEY=yyy SUPER_SKU=123456 python test_create_voronezh.py
+"""
+
 import asyncio
-import random
-import logging
 import json
+import logging
 import os
+import random
 from datetime import datetime, timedelta
-import pytz
+
 import aiohttp
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+import pytz
 
 # ===== НАСТРОЙКИ =====
 OZON_CLIENT_ID = os.environ["OZON_CLIENT_ID"]
 OZON_API_KEY   = os.environ["OZON_API_KEY"]
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+SUPER_SKU      = int(os.environ["SUPER_SKU"])   # SKU одного Super-товара для теста
 OZON_API_URL   = "https://api-seller.ozon.ru"
 MOSCOW_TZ      = pytz.timezone("Europe/Moscow")
 
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=TELEGRAM_TOKEN)
-dp  = Dispatcher()
+STAVROPOL_WAREHOUSE_NAME = "СТАВРОПОЛЬ_АППЗ_2"  # точка отгрузки
+TARGET_CLUSTER_NAME      = "Воронеж"             # тестовый кластер
 
-# ===== МАППИНГ КЛАСТЕРОВ (заполняется лениво) =====
-CLUSTER_NAMES: dict = {}
-
-# ===== КЭШ =====
-_cache: dict = {}
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
 
-# ===== АДАПТИВНЫЙ RATE LIMITER =====
-_bundle_semaphore = asyncio.Semaphore(3)   # не более 3 параллельных bundle-запросов
-_bundle_delay     = 0.15                   # начальная задержка между запросами (сек)
-_bundle_delay_min = 0.05
-_bundle_delay_max = 2.0
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
-def _adjust_delay(success: bool) -> None:
-    global _bundle_delay
-    if success:
-        _bundle_delay = max(_bundle_delay_min, _bundle_delay * 0.9)   # -10% при успехе
-    else:
-        _bundle_delay = min(_bundle_delay_max, _bundle_delay * 1.5)   # +50% при 429
-    logging.debug(f"bundle_delay={_bundle_delay:.3f}s")
-
-
-# ===== ЗАГОЛОВКИ =====
 def ozon_headers() -> dict:
     return {
         "Client-Id":    OZON_CLIENT_ID,
@@ -52,816 +48,370 @@ def ozon_headers() -> dict:
     }
 
 
-# ===== POST с retry на 429 =====
-async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, retries: int = 3) -> dict:
+async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, retries: int = 5) -> dict:
+    """POST с retry на 429."""
     for attempt in range(retries):
         async with session.post(url, headers=ozon_headers(), json=payload) as resp:
             raw = await resp.text()
             if resp.status == 429:
-                wait = 1.0 * (attempt + 1)
-                logging.warning(f"429 rate limit, жду {wait}с...")
+                wait = 1.5 * (attempt + 1)
+                log.warning(f"429 rate limit → жду {wait}с (attempt {attempt + 1})")
                 await asyncio.sleep(wait)
                 continue
-            logging.info(f"POST {url} → {resp.status} | {raw[:200]}")
+            log.info(f"POST {url} → HTTP {resp.status} | {raw[:300]}")
             if resp.status != 200:
-                raise Exception(f"HTTP {resp.status} [{url}]: {raw[:200]}")
+                raise Exception(f"HTTP {resp.status} [{url}]: {raw[:300]}")
             return json.loads(raw)
     raise Exception(f"Превышен лимит запросов к {url}")
 
 
-# ===== ЗАГРУЗКА НАЗВАНИЙ КЛАСТЕРОВ =====
-async def resolve_cluster_names(cluster_ids: list[str]) -> None:
-    """Загружает все кластеры через /v1/cluster/list с CLUSTER_TYPE_OZON."""
-    global CLUSTER_NAMES
-    if CLUSTER_NAMES:  # уже загружено
-        return
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{OZON_API_URL}/v1/cluster/list",
-                headers=ozon_headers(),
-                json={"cluster_type": "CLUSTER_TYPE_OZON"}
-            ) as resp:
-                raw  = await resp.text()
-                logging.info(f"cluster/list OZON → {resp.status} | {raw[:400]}")
-                if resp.status == 200:
-                    data = json.loads(raw)
-                    for c in data.get("clusters", []):
-                        cid  = str(c.get("macrolocal_cluster_id", ""))
-                        name = c.get("name", "")
-                        if cid and name:
-                            CLUSTER_NAMES[cid] = name
-                    logging.info(f"Загружено кластеров: {len(CLUSTER_NAMES)}")
-                else:
-                    logging.warning(f"cluster/list вернул {resp.status}: {raw[:200]}")
-    except Exception as e:
-        logging.warning(f"Ошибка загрузки кластеров: {e}")
+async def poll(session: aiohttp.ClientSession, url: str, payload: dict,
+               success_statuses: list, fail_statuses: list,
+               status_field: str = "status",
+               interval: float = 3.0, max_attempts: int = 20) -> dict:
+    """Polling до получения финального статуса."""
+    for attempt in range(max_attempts):
+        data   = await ozon_post(session, url, payload)
+        status = data.get(status_field, "")
+        log.info(f"polling {url} → status={status} (attempt {attempt + 1})")
+        if status in success_statuses:
+            return data
+        if status in fail_statuses:
+            raise Exception(f"Операция завершилась с ошибкой: {status} | {data}")
+        await asyncio.sleep(interval)
+    raise Exception(f"Polling {url} превысил {max_attempts} попыток")
 
 
-def cluster_name(cluster_id: str) -> str:
-    name = CLUSTER_NAMES.get(str(cluster_id), "")
-    if name:
-        return f"Кластер {name}"
-    return f"Кластер {cluster_id}"
+# ===== ШАГ 1: Найти cluster_id Воронежа =====
+
+async def find_voronezh_cluster(session: aiohttp.ClientSession) -> tuple[str, list[int]]:
+    """
+    Возвращает (cluster_id, [warehouse_id, ...]) для кластера Воронеж.
+    cluster_id — строка (macrolocal_cluster_id из /v1/cluster/list).
+    """
+    data = await ozon_post(session, f"{OZON_API_URL}/v1/cluster/list",
+                           {"cluster_type": "CLUSTER_TYPE_OZON"})
+    clusters = data.get("clusters", [])
+    log.info(f"Всего кластеров OZON: {len(clusters)}")
+
+    for c in clusters:
+        name = c.get("name", "")
+        log.info(f"  Кластер: id={c.get('id')} name={name}")
+        if TARGET_CLUSTER_NAME.lower() in name.lower():
+            cluster_id  = str(c.get("id"))
+            wh_ids = []
+            for lc in c.get("logistic_clusters", []):
+                for wh in lc.get("warehouses", []):
+                    wh_ids.append(wh.get("warehouse_id"))
+            log.info(f"✅ Найден кластер: id={cluster_id} name={name} warehouses={wh_ids}")
+            return cluster_id, wh_ids
+
+    raise Exception(f"Кластер '{TARGET_CLUSTER_NAME}' не найден!")
 
 
-# ===== НАЗВАНИЯ ТОВАРОВ =====
-async def fetch_product_names(product_ids: list) -> dict:
-    result = {}
-    async with aiohttp.ClientSession() as session:
-        for i in range(0, len(product_ids), 1000):
-            chunk = product_ids[i:i + 1000]
-            try:
-                data = await ozon_post(session, f"{OZON_API_URL}/v3/product/info/list", {"product_id": chunk})
-                for item in data.get("items", []):
-                    pid = item.get("id")
-                    if pid:
-                        result[pid] = item.get("name", "—")
-            except Exception as e:
-                logging.warning(f"product/info/list: {e}")
-    return result
+# ===== ШАГ 2: Найти warehouse_id точки отгрузки СТАВРОПОЛЬ_АППЗ_2 =====
+
+async def find_stavropol_warehouse(session: aiohttp.ClientSession) -> int:
+    """
+    Ищет точку отгрузки через /v1/warehouse/fbo/list.
+    Пробует оба типа поставки.
+    """
+    for supply_type in ["CREATE_TYPE_CROSSDOCK", "CREATE_TYPE_DIRECT"]:
+        try:
+            data = await ozon_post(
+                session,
+                f"{OZON_API_URL}/v1/warehouse/fbo/list",
+                {
+                    "filter_by_supply_type": [supply_type],
+                    "search": STAVROPOL_WAREHOUSE_NAME
+                }
+            )
+            results = data.get("search", [])
+            log.info(f"warehouse/fbo/list ({supply_type}) → {len(results)} результатов")
+            for wh in results:
+                log.info(f"  warehouse: id={wh.get('warehouse_id')} name={wh.get('name')}")
+                if STAVROPOL_WAREHOUSE_NAME.lower() in wh.get("name", "").lower():
+                    wh_id = wh["warehouse_id"]
+                    log.info(f"✅ Найдена точка отгрузки: id={wh_id} name={wh['name']} type={supply_type}")
+                    return wh_id, supply_type
+        except Exception as e:
+            log.warning(f"warehouse/fbo/list ({supply_type}): {e}")
+
+    # Если не нашли точное совпадение — берём первый результат из DIRECT
+    data = await ozon_post(
+        session,
+        f"{OZON_API_URL}/v1/warehouse/fbo/list",
+        {"filter_by_supply_type": ["CREATE_TYPE_DIRECT"], "search": "СТАВРОПОЛЬ"}
+    )
+    results = data.get("search", [])
+    if results:
+        wh = results[0]
+        log.warning(f"⚠️ Точное совпадение не найдено, берём первый результат: {wh}")
+        return wh["warehouse_id"], "CREATE_TYPE_DIRECT"
+
+    raise Exception(f"Точка отгрузки '{STAVROPOL_WAREHOUSE_NAME}' не найдена!")
 
 
-# ===== ПОЛУЧЕНИЕ order_id — только DATA_FILLING =====
-async def fetch_supply_order_ids(session: aiohttp.ClientSession) -> list:
-    order_ids = []
-    last_id   = ""
-    limit     = 50
+# ===== ШАГ 3-4: Создать черновик и получить draft_id =====
 
-    while True:
-        payload = {"filter": {"states": ["DATA_FILLING"]}, "sort_by": 1, "limit": limit}
-        if last_id:
-            payload["last_id"] = last_id
+async def create_draft(session: aiohttp.ClientSession,
+                       cluster_id: str,
+                       drop_off_warehouse_id: int,
+                       supply_type: str,
+                       sku: int,
+                       quantity: int) -> tuple[int, list[dict]]:
+    """
+    Создаёт черновик заявки.
+    Возвращает (draft_id, clusters_info) из /v1/draft/create/info.
+    """
+    payload = {
+        "cluster_ids": [cluster_id],
+        "items":       [{"sku": sku, "quantity": quantity}],
+        "type":        supply_type,
+    }
+    if supply_type == "CREATE_TYPE_CROSSDOCK":
+        payload["drop_off_point_warehouse_id"] = drop_off_warehouse_id
 
-        data    = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/list", payload)
-        batch   = data.get("order_ids", [])
-        if not batch:
-            break
-        order_ids.extend(batch)
-        new_last_id = str(data.get("last_id", ""))
-        if not new_last_id or new_last_id == last_id or len(batch) < limit:
-            break
-        last_id = new_last_id
+    resp = await ozon_post(session, f"{OZON_API_URL}/v1/draft/create", payload)
+    operation_id = resp.get("operation_id")
+    if not operation_id:
+        raise Exception(f"draft/create не вернул operation_id: {resp}")
+    log.info(f"draft/create → operation_id={operation_id}")
 
+    # Polling /v1/draft/create/info
+    info = await poll(
+        session,
+        f"{OZON_API_URL}/v1/draft/create/info",
+        {"operation_id": operation_id},
+        success_statuses=["CALCULATION_STATUS_SUCCESS"],
+        fail_statuses=["CALCULATION_STATUS_FAILED", "CALCULATION_STATUS_EXPIRED"],
+        interval=3.0,
+        max_attempts=20
+    )
+
+    draft_id = info.get("draft_id")
+    clusters = info.get("clusters", [])
+    errors   = info.get("errors", [])
+
+    if errors:
+        log.warning(f"draft/create/info errors: {errors}")
+    if not draft_id:
+        raise Exception(f"draft/create/info не вернул draft_id: {info}")
+
+    log.info(f"✅ draft_id={draft_id}, кластеров в ответе: {len(clusters)}")
+    return draft_id, clusters
+
+
+# ===== ШАГ 5: Получить доступные слоты =====
+
+async def find_timeslot(session: aiohttp.ClientSession,
+                        draft_id: int,
+                        drop_off_warehouse_id: int,
+                        day_offset_min: int = 14,
+                        day_offset_max: int = 19) -> tuple[str, str]:
+    """
+    Ищет доступный слот 19:00-20:00 МСК (16:00-17:00 UTC) или 18:00-19:00 МСК (15:00-16:00 UTC)
+    в диапазоне +14..+19 дней от сегодня.
+    Если нужный слот недоступен в выбранный день — пробует другой день в диапазоне.
+    Возвращает (from_in_timezone, to_in_timezone) в ISO формате.
+    """
+    today    = datetime.now(MOSCOW_TZ).date()
+    date_from = today + timedelta(days=day_offset_min)
+    date_to   = today + timedelta(days=day_offset_max)
+
+    data = await ozon_post(
+        session,
+        f"{OZON_API_URL}/v1/draft/timeslot/info",
+        {
+            "draft_id":      draft_id,
+            "date_from":     date_from.strftime("%Y-%m-%dT00:00:00Z"),
+            "date_to":       date_to.strftime("%Y-%m-%dT23:59:59Z"),
+            "warehouse_ids": [str(drop_off_warehouse_id)],
+        }
+    )
+
+    wh_slots = data.get("drop_off_warehouse_timeslots", [])
+    log.info(f"timeslot/info → {len(wh_slots)} складов с слотами")
+
+    # Предпочтительные часы МСК (UTC = МСК - 3)
+    preferred_slots = [
+        ("19:00", "20:00", "16:00", "17:00"),   # 19-20 МСК = 16-17 UTC
+        ("18:00", "19:00", "15:00", "16:00"),   # 18-19 МСК = 15-16 UTC
+    ]
+
+    # Собираем все доступные дни и их слоты
+    days_pool = []
+    for wh in wh_slots:
+        tz = wh.get("warehouse_timezone", "Europe/Moscow")
+        for day in wh.get("days", []):
+            date_str = day.get("date_in_timezone", "")[:10]
+            for ts in day.get("timeslots", []):
+                ts_from = ts.get("from_in_timezone", "")
+                ts_to   = ts.get("to_in_timezone", "")
+                days_pool.append((date_str, ts_from, ts_to))
+                log.info(f"  доступный слот: {date_str} {ts_from} – {ts_to}")
+
+    if not days_pool:
+        raise Exception("Нет доступных слотов в указанном диапазоне дат!")
+
+    # Выбираем случайный день из диапазона и ищем предпочтительный слот
+    available_dates = sorted(set(d[0] for d in days_pool))
+    random.shuffle(available_dates)  # случайный порядок дат
+
+    for target_date in available_dates:
+        slots_on_date = [(f, t) for d, f, t in days_pool if d == target_date]
+        for (msk_from, msk_to, _, _) in preferred_slots:
+            for (ts_from, ts_to) in slots_on_date:
+                if msk_from in ts_from or msk_from in ts_to:
+                    log.info(f"✅ Выбран слот: {target_date} {ts_from} – {ts_to} (МСК {msk_from}-{msk_to})")
+                    return ts_from, ts_to
+
+        # Если предпочтительных слотов нет — берём любой на эту дату
+        if slots_on_date:
+            ts_from, ts_to = slots_on_date[0]
+            log.warning(f"⚠️ Предпочтительные слоты недоступны на {target_date}, берём: {ts_from} – {ts_to}")
+            return ts_from, ts_to
+
+    raise Exception("Не удалось найти подходящий слот!")
+
+
+# ===== ШАГ 6-7: Создать заявку из черновика =====
+
+async def create_supply_from_draft(session: aiohttp.ClientSession,
+                                   draft_id: int,
+                                   placement_warehouse_id: int,
+                                   ts_from: str,
+                                   ts_to: str) -> list[str]:
+    """
+    Создаёт заявку из черновика.
+    Возвращает список order_ids.
+    """
+    resp = await ozon_post(
+        session,
+        f"{OZON_API_URL}/v1/draft/supply/create",
+        {
+            "draft_id":     draft_id,
+            "warehouse_id": placement_warehouse_id,
+            "timeslot": {
+                "from_in_timezone": ts_from,
+                "to_in_timezone":   ts_to,
+            }
+        }
+    )
+    operation_id = resp.get("operation_id")
+    if not operation_id:
+        raise Exception(f"draft/supply/create не вернул operation_id: {resp}")
+    log.info(f"draft/supply/create → operation_id={operation_id}")
+
+    # Polling статуса
+    status_data = await poll(
+        session,
+        f"{OZON_API_URL}/v1/draft/supply/create/status",
+        {"operation_id": operation_id},
+        success_statuses=["DraftSupplyCreateStatusSuccess"],
+        fail_statuses=["DraftSupplyCreateStatusFailed"],
+        interval=3.0,
+        max_attempts=20
+    )
+
+    order_ids = status_data.get("result", {}).get("order_ids", [])
+    errors    = status_data.get("error_messages", [])
+
+    if errors:
+        raise Exception(f"draft/supply/create/status errors: {errors}")
+    if not order_ids:
+        raise Exception(f"Заявки не созданы, ответ: {status_data}")
+
+    log.info(f"✅ Созданы заявки: {order_ids}")
     return order_ids
 
 
-# ===== ДЕТАЛИ ЗАЯВОК =====
-async def fetch_supply_order_details(session: aiohttp.ClientSession, order_ids: list) -> list[dict]:
-    orders = []
-    for i in range(0, len(order_ids), 50):
-        chunk = order_ids[i:i + 50]
-        try:
-            data = await ozon_post(session, f"{OZON_API_URL}/v3/supply-order/get", {"order_ids": chunk})
-            orders.extend(data.get("orders", []))
-        except Exception as e:
-            logging.warning(f"supply-order/get: {e}")
-    return orders
+# ===== ГЛАВНАЯ ФУНКЦИЯ ТЕСТА =====
 
-
-# ===== ТОВАРЫ ИЗ БАНДЛОВ =====
-async def _fetch_one_bundle(session: aiohttp.ClientSession, bid: str) -> tuple[str, list]:
-    """Загрузить один bundle с семафором и адаптивной задержкой."""
-    global _bundle_delay
-    async with _bundle_semaphore:
-        await asyncio.sleep(_bundle_delay)
-        for attempt in range(4):
-            try:
-                async with session.post(
-                    f"{OZON_API_URL}/v1/supply-order/bundle",
-                    headers=ozon_headers(),
-                    json={"bundle_ids": [bid], "last_id": "", "limit": 100}
-                ) as resp:
-                    if resp.status == 429:
-                        _adjust_delay(False)
-                        wait = _bundle_delay * (attempt + 1)
-                        logging.warning(f"bundle 429, жду {wait:.2f}с (attempt {attempt+1})")
-                        await asyncio.sleep(wait)
-                        continue
-                    raw = await resp.text()
-                    if resp.status != 200:
-                        logging.warning(f"bundle {bid[:8]} HTTP {resp.status}")
-                        return bid, []
-                    _adjust_delay(True)
-                    data = json.loads(raw)
-                    logging.info(f"POST {OZON_API_URL}/v1/supply-order/bundle → {resp.status} | {raw[:200]}")
-                    return bid, data.get("items", [])
-            except Exception as e:
-                logging.warning(f"bundle {bid[:8]} attempt {attempt}: {e}")
-                await asyncio.sleep(_bundle_delay)
-        return bid, []
-
-
-async def fetch_bundle_items(session: aiohttp.ClientSession, bundle_ids: list) -> dict:
-    """Параллельная загрузка бандлов (до 3 одновременно) с адаптивной задержкой."""
-    tasks = [_fetch_one_bundle(session, bid) for bid in bundle_ids]
-    pairs = await asyncio.gather(*tasks)
-    return dict(pairs)
-
-
-# ===== КЛЮЧ И МЕТКА НАЗНАЧЕНИЯ =====
-def get_dest_key(order: dict) -> str:
-    for supply in order.get("supplies", []):
-        storage_wh = supply.get("storage_warehouse") or {}
-        wh_name    = storage_wh.get("name", "")
-        if wh_name:
-            return f"wh::{wh_name}"
-        cluster_id = supply.get("macrolocal_cluster_id", "")
-        if cluster_id:
-            return f"cl::{cluster_id}"
-    return "unknown::Без назначения"
-
-
-def get_dest_label(dest_key: str) -> str:
-    if dest_key.startswith("wh::"):
-        return dest_key[4:]
-    if dest_key.startswith("cl::"):
-        return cluster_name(dest_key[4:])
-    return dest_key
-
-
-
-# ===== ПЕРЕНОС БЛИЖАЙШИХ ЗАЯВОК =====
-async def reschedule_near_orders() -> str:
-    """Переносит заявки DATA_FILLING с датой поставки в ближайшие 5 дней
-    на случайную дату от +15 до +27 дней от сегодня, слот 19:00-20:00 МСК (16:00-17:00 UTC)."""
-    today    = datetime.now(MOSCOW_TZ).date()
-    date_to  = today + timedelta(days=5)
-    results, errors = [], []
+async def test_create_voronezh():
+    log.info("=" * 60)
+    log.info(f"ТЕСТ: Создание заявки в кластер '{TARGET_CLUSTER_NAME}'")
+    log.info(f"SKU: {SUPER_SKU} | Количество: 5 шт")
+    log.info("=" * 60)
 
     async with aiohttp.ClientSession() as session:
-        # Берём только DATA_FILLING
-        order_ids = await fetch_supply_order_ids(session)
-        if not order_ids:
-            return "📭 Нет заявок со статусом «Заполнение данных»."
+        # Шаг 1: найти кластер Воронеж
+        log.info("\n--- ШАГ 1: Поиск кластера Воронеж ---")
+        cluster_id, cluster_wh_ids = await find_voronezh_cluster(session)
 
-        orders = await fetch_supply_order_details(session, order_ids)
+        # Шаг 2: найти точку отгрузки
+        log.info("\n--- ШАГ 2: Поиск точки отгрузки ---")
+        drop_off_wh_id, supply_type = await find_stavropol_warehouse(session)
 
-    # Фильтруем: дата поставки от сегодня до сегодня+5
-    near_orders = []
-    for order in orders:
-        ts      = order.get("timeslot", {}).get("timeslot", {})
-        ts_from = ts.get("from", "")
-        if not ts_from:
-            continue
-        try:
-            dt = datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S")
-            dt = MOSCOW_TZ.localize(dt)
-            if today <= dt.date() <= date_to:
-                near_orders.append(order)
-        except Exception:
-            continue
-
-    if not near_orders:
-        return (
-            f"📭 Заявок DATA_FILLING с датой поставки в ближайшие 5 дней нет.\n"
-            f"Всего DATA_FILLING заявок: {len(orders)}"
+        # Шаг 3-4: создать черновик
+        log.info(f"\n--- ШАГ 3-4: Создание черновика (тип={supply_type}) ---")
+        draft_id, clusters_info = await create_draft(
+            session,
+            cluster_id=cluster_id,
+            drop_off_warehouse_id=drop_off_wh_id,
+            supply_type=supply_type,
+            sku=SUPER_SKU,
+            quantity=5
         )
 
-    async with aiohttp.ClientSession() as session:
-        for order in near_orders[:5]:  # ТЕСТ: только первые 5
-            order_id  = order.get("order_id")
-            order_num = order.get("order_number", str(order_id))
-            try:
-                # Текущая дата поставки
-                ts_from = order["timeslot"]["timeslot"]["from"]
-                cur_dt  = MOSCOW_TZ.localize(datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S"))
-                cur_str = cur_dt.strftime("%d.%m.%Y")
+        # Из clusters_info получаем placement warehouse_id
+        # (склад размещения — куда едет товар, может отличаться от drop_off)
+        placement_wh_id = None
+        for cl in clusters_info:
+            for wh in cl.get("warehouses", []):
+                if wh.get("status", {}).get("is_available"):
+                    placement_wh_id = wh.get("supply_warehouse", {}).get("warehouse_id")
+                    log.info(f"  Склад размещения: {wh.get('supply_warehouse', {}).get('name')} id={placement_wh_id}")
+                    break
+            if placement_wh_id:
+                break
 
-                # Целевая дата: случайно +15..+27 дней от сегодня
-                days_ahead  = random.randint(15, 27)
-                target_date = today + timedelta(days=days_ahead)
-                # 19:00-20:00 МСК = 16:00-17:00 UTC
-                time_from = f"{target_date.strftime('%Y-%m-%d')}T16:00:00Z"
-                time_to   = f"{target_date.strftime('%Y-%m-%d')}T17:00:00Z"
+        if not placement_wh_id:
+            # Fallback: берём первый склад из кластера
+            for cl in clusters_info:
+                for wh in cl.get("warehouses", []):
+                    placement_wh_id = wh.get("supply_warehouse", {}).get("warehouse_id")
+                    log.warning(f"⚠️ Нет доступного склада, берём первый: id={placement_wh_id}")
+                    break
+                if placement_wh_id:
+                    break
 
-                resp = await ozon_post(
-                    session,
-                    f"{OZON_API_URL}/v1/supply-order/timeslot/update",
-                    {"supply_order_id": order_id, "timeslot": {"from": time_from, "to": time_to}},
-                    retries=3
-                )
-                logging.info(f"timeslot/update #{order_id} → {resp}")
+        if not placement_wh_id:
+            raise Exception("Не найден склад размещения в ответе draft/create/info!")
 
-                errs = resp.get("errors") or []
-                op_id = resp.get("operation_id")
-                success = not errs
-
-                # Если update принят — проверяем финальный статус
-                if op_id and not errs:
-                    await asyncio.sleep(2)
-                    try:
-                        status_resp = await ozon_post(
-                            session,
-                            f"{OZON_API_URL}/v1/supply-order/timeslot/status",
-                            {"supply_order_id": order_id},
-                            retries=3
-                        )
-                        logging.info(f"timeslot/status #{order_id} → {status_resp}")
-                        if status_resp.get("status") != "STATUS_SUCCESS":
-                            success = False
-                    except Exception:
-                        pass
-
-                if success:
-                    results.append(
-                        f"✅ #{order_num}\n"
-                        f"   {cur_str} → {target_date.strftime('%d.%m.%Y')} (+{days_ahead}д)"
-                    )
-                else:
-                    # Fallback: фиксированные +15 дней от сегодня
-                    fallback_date = today + timedelta(days=15)
-                    fb_from = f"{fallback_date.strftime('%Y-%m-%d')}T16:00:00Z"
-                    fb_to   = f"{fallback_date.strftime('%Y-%m-%d')}T17:00:00Z"
-                    try:
-                        fb_resp = await ozon_post(
-                            session,
-                            f"{OZON_API_URL}/v1/supply-order/timeslot/update",
-                            {"supply_order_id": order_id, "timeslot": {"from": fb_from, "to": fb_to}},
-                            retries=3
-                        )
-                        logging.info(f"timeslot/fallback #{order_id} → {fb_resp}")
-                        await asyncio.sleep(2)
-                        fb_status = await ozon_post(
-                            session,
-                            f"{OZON_API_URL}/v1/supply-order/timeslot/status",
-                            {"supply_order_id": order_id},
-                            retries=3
-                        )
-                        if fb_status.get("status") == "STATUS_SUCCESS":
-                            results.append(
-                                f"⚠️ #{order_num} (fallback +15д)\n"
-                                f"   {cur_str} → {fallback_date.strftime('%d.%m.%Y')}"
-                            )
-                        else:
-                            errors.append(f"❌ #{order_num}: fallback тоже не удался: {fb_status.get('errors')}")
-                    except Exception as fb_e:
-                        errors.append(f"❌ #{order_num}: {errs} | fallback: {str(fb_e)[:80]}")
-            except Exception as e:
-                logging.exception(f"reschedule #{order_id}: {e}")
-                errors.append(f"❌ #{order_num}: {str(e)[:100]}")
-
-    lines = [
-        f"🔄 Перенос ближайших заявок DATA_FILLING",
-        f"Найдено: {len(near_orders)} заявок (дата поставки сегодня–{date_to.strftime('%d.%m')})",
-        f"Целевое время: 19:00–20:00 МСК\n",
-    ]
-    if results:
-        lines.extend(results)
-    if errors:
-        lines.append("\nОшибки:")
-        lines.extend(errors)
-    return "\n".join(lines)
-
-
-# ===== ЗАГРУЗКА И ГРУППИРОВКА ВСЕХ ЗАЯВОК =====
-async def load_all_orders() -> dict:
-    async with aiohttp.ClientSession() as session:
-        order_ids = await fetch_supply_order_ids(session)
-        logging.info(f"DATA_FILLING: {len(order_ids)} заявок")
-        if not order_ids:
-            return {}
-
-        orders = await fetch_supply_order_details(session, order_ids)
-
-        bundle_ids = []
-        for order in orders:
-            for supply in order.get("supplies", []):
-                bid = supply.get("bundle_id")
-                if bid:
-                    bundle_ids.append(bid)
-
-        bundle_items = await fetch_bundle_items(session, bundle_ids) if bundle_ids else {}
-
-        for order in orders:
-            for supply in order.get("supplies", []):
-                bid = supply.get("bundle_id")
-                supply["_items"] = bundle_items.get(bid, []) if bid else []
-
-    # Собираем уникальные cluster_id и пробуем получить названия
-    cluster_ids = set()
-    for order in orders:
-        for supply in order.get("supplies", []):
-            cid = supply.get("macrolocal_cluster_id", "")
-            if cid:
-                cluster_ids.add(str(cid))
-
-    if cluster_ids:
-        await resolve_cluster_names(list(cluster_ids))
-
-    grouped: dict = {}
-    for order in orders:
-        key = get_dest_key(order)
-        grouped.setdefault(key, []).append(order)
-
-    return grouped
-
-
-
-# ===== ПЕРЕНОС ТАЙМСЛОТОВ =====
-async def reschedule_near_orders(grouped: dict) -> str:
-    """
-    Переносит заявки DATA_FILLING с датой в ближайшие 5 дней
-    на случайную дату +15..+27 дней, таймслот 19:00-20:00 МСК (= 16:00-17:00 UTC).
-    """
-    moscow_tz = MOSCOW_TZ
-    now        = datetime.now(moscow_tz).replace(hour=0, minute=0, second=0, microsecond=0)
-    date_to    = now + timedelta(days=5)
-
-    # Собираем заявки DATA_FILLING с датой в ближайшие 5 дней
-    near_orders = []
-    for orders in grouped.values():
-        for order in orders:
-            if order.get("state") != "DATA_FILLING":
-                continue
-            ts      = order.get("timeslot", {}).get("timeslot", {})
-            ts_from = ts.get("from", "")
-            if not ts_from:
-                continue
-            try:
-                dt = datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S")
-                dt = moscow_tz.localize(dt)
-                if now <= dt <= date_to:
-                    near_orders.append(order)
-            except Exception:
-                continue
-
-    if not near_orders:
-        return "📭 Заявок DATA_FILLING в ближайшие 5 дней не найдено."
-
-    results = []
-    errors  = []
-
-    async with aiohttp.ClientSession() as session:
-        for order in near_orders:
-            order_id = order.get("order_id")
-            order_num = order.get("order_number", str(order_id))
-            try:
-                ts_old = (order.get("timeslot", {}).get("timeslot", {}).get("from", "")[:10])
-
-                # Случайная дата +15..+27 дней от сегодня
-                random_days = random.randint(15, 27)
-                target_date = (now + timedelta(days=random_days)).date()
-
-                # 19:00-20:00 МСК = 16:00-17:00 UTC
-                time_from = f"{target_date.strftime('%Y-%m-%d')}T16:00:00Z"
-                time_to   = f"{target_date.strftime('%Y-%m-%d')}T17:00:00Z"
-
-                resp = await ozon_post(
-                    session,
-                    f"{OZON_API_URL}/v1/supply-order/timeslot/update",
-                    {"supply_order_id": order_id, "timeslot": {"from": time_from, "to": time_to}}
-                )
-                logging.info(f"timeslot/update #{order_id} → {resp}")
-
-                errs = resp.get("errors", [])
-                if not errs:
-                    results.append(
-                        f"✅ {order_num}: {ts_old} → {target_date.strftime('%d.%m')} (+{random_days}д) 19:00-20:00"
-                    )
-                    # Проверяем статус асинхронно если есть operation_id
-                    op_id = resp.get("operation_id", "")
-                    if op_id:
-                        await asyncio.sleep(2)
-                        try:
-                            status = await ozon_post(
-                                session,
-                                f"{OZON_API_URL}/v1/supply-order/timeslot/status",
-                                {"operation_id": op_id}
-                            )
-                            logging.info(f"timeslot/status #{order_id} → {status}")
-                        except Exception:
-                            pass
-                else:
-                    errors.append(f"❌ {order_num}: {errs}")
-
-                await asyncio.sleep(1)  # пауза между запросами
-
-            except Exception as e:
-                logging.warning(f"timeslot update error #{order_id}: {e}")
-                errors.append(f"❌ {order_num}: {e}")
-
-        header = (
-        "🔄 Перенос ближайших заявок DATA_FILLING\n"
-        + f"Найдено: {len(near_orders)} заявок (сегодня–{date_to.strftime('%d.%m')})\n"
-        + "Целевое время: 19:00–20:00 МСК\n"
-    )
-    lines = [header]
-    if results:
-        lines.extend(results)
-    if errors:
-        lines.append("\nОшибки:")
-        lines.extend(errors)
-    return "\n".join(lines)
-
-# ===== ГЛАВНОЕ МЕНЮ =====
-def main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Ближайшие заявки на перенос", callback_data="show_skus")],
-        [InlineKeyboardButton(text="🔄 Перенести ближайшие заявки",  callback_data="do_reschedule")],
-        [InlineKeyboardButton(text="🚚 Заявки на поставку",          callback_data="show_supplies")],
-    ])
-
-
-# ===== МЕНЮ СКЛАДОВ/КЛАСТЕРОВ =====
-def dest_menu(grouped: dict) -> InlineKeyboardMarkup:
-    buttons = []
-    for dest_key, orders in sorted(grouped.items(), key=lambda x: get_dest_label(x[0])):
-        label = f"{get_dest_label(dest_key)} ({len(orders)})"
-        buttons.append([InlineKeyboardButton(
-            text=label,
-            callback_data=f"dest::{dest_key[:50]}"
-        )])
-    buttons.append([InlineKeyboardButton(text="🔄 Обновить",     callback_data="show_supplies")])
-    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-# ===== СТАРТ =====
-@dp.message(CommandStart())
-async def cmd_start(message: types.Message):
-    try:
-        await message.delete()
-    except Exception:
-        pass
-    chat_id    = message.chat.id
-    message_id = message.message_id
-    for mid in range(message_id - 1, max(message_id - 50, 0), -1):
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=mid)
-        except Exception:
-            pass
-    await bot.send_message(chat_id=chat_id, text="Привет! Выбери действие:", reply_markup=main_menu())
-
-
-# ===== ГЛАВНОЕ МЕНЮ (callback) =====
-@dp.callback_query(F.data == "main_menu")
-async def handle_main_menu(call: CallbackQuery):
-    await call.answer()
-    await call.message.edit_text("Выбери действие:", reply_markup=main_menu())
-
-
-# ===== БЛИЖАЙШИЕ ЗАЯВКИ НА ПЕРЕНОС =====
-@dp.callback_query(F.data == "show_skus")
-async def handle_show_skus(call: CallbackQuery):
-    await call.answer()
-    await call.message.edit_text("⏳ Ищу заявки с датой поставки в ближайшие 5 дней...")
-
-    grouped = _cache.get("grouped")
-    if not grouped:
-        try:
-            grouped = await load_all_orders()
-            _cache["grouped"] = grouped
-        except Exception as e:
-            await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
-            return
-
-    all_orders = [order for orders in grouped.values() for order in orders]
-    now        = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
-    date_to    = now + timedelta(days=5)
-
-    near_orders = []
-    for order in all_orders:
-        ts      = order.get("timeslot", {}).get("timeslot", {})
-        ts_from = ts.get("from", "")
-        if not ts_from:
-            continue
-        try:
-            dt = datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S")
-            dt = MOSCOW_TZ.localize(dt)
-            if now <= dt <= date_to:
-                near_orders.append((dt, order))
-        except Exception:
-            continue
-
-    near_orders.sort(key=lambda x: x[0])
-
-    if not near_orders:
-        await call.message.edit_text(
-            "📭 Заявок с датой поставки в ближайшие 5 дней не найдено.",
-            reply_markup=main_menu()
+        # Шаг 5: получить слот
+        log.info("\n--- ШАГ 5: Поиск таймслота ---")
+        # Для timeslot/info используем drop_off warehouse (точку отгрузки)
+        ts_from, ts_to = await find_timeslot(
+            session,
+            draft_id=draft_id,
+            drop_off_warehouse_id=drop_off_wh_id,
+            day_offset_min=14,
+            day_offset_max=19
         )
-        return
 
-    all_pids = set()
-    for _, order in near_orders:
-        for supply in order.get("supplies", []):
-            for item in supply.get("_items", []):
-                pid = item.get("product_id")
-                if pid:
-                    all_pids.add(pid)
-
-    names = await fetch_product_names(list(all_pids)) if all_pids else {}
-    lines = [f"📅 Заявок в ближайшие 5 дней: {len(near_orders)}\n"]
-
-    for dt, order in near_orders:
-        order_id  = order.get("order_id", "—")
-        order_num = order.get("order_number", "")
-        created   = order.get("created_date", "")[:10]
-        deadline  = (order.get("data_filling_deadline") or "")[:10]
-        dest      = get_dest_label(get_dest_key(order))
-
-        lines.append("━━━━━━━━━━━━━━━━━━")
-        lines.append(f"📋 #{order_id} ({order_num})")
-        lines.append(f"🏭 Назначение: {dest}")
-        lines.append(f"🗓 Дата поставки: {dt.strftime('%Y-%m-%d %H:%M')}")
-        lines.append(f"📅 Создана: {created}")
-        if deadline:
-            lines.append(f"⏰ Дедлайн: {deadline}")
-
-        for supply in order.get("supplies", []):
-            items = supply.get("_items", [])
-            if items:
-                lines.append("Товары:")
-                for item in items:
-                    sku  = item.get("sku", "—")
-                    pid  = item.get("product_id")
-                    qty  = item.get("quantity", "—")
-                    name = names.get(pid, item.get("name", "—"))
-                    lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
-        lines.append("")
-
-    text_full = "\n".join(lines)
-    chunks    = [text_full[i:i + 4000] for i in range(0, len(text_full), 4000)]
-    back_kb   = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-    ])
-
-    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
-    for i, chunk in enumerate(chunks[1:], 1):
-        await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
-    if len(chunks) > 1:
-        await call.message.answer("⬆️ Список выше", reply_markup=back_kb)
-
-
-
-# ===== ПЕРЕНОС — ОБРАБОТЧИК =====
-@dp.callback_query(F.data == "do_reschedule")
-async def handle_do_reschedule(call: CallbackQuery):
-    await call.answer()
-
-    grouped = _cache.get("grouped")
-    if not grouped:
-        await call.message.edit_text("⏳ Загружаю заявки...")
-        try:
-            grouped = await load_all_orders()
-            _cache["grouped"] = grouped
-        except Exception as e:
-            await call.message.edit_text(f"❌ Ошибка загрузки:\n{e}", reply_markup=main_menu())
-            return
-
-    # Подсчитаем сколько заявок попадает под критерий
-    moscow_tz = MOSCOW_TZ
-    now       = datetime.now(moscow_tz).replace(hour=0, minute=0, second=0, microsecond=0)
-    date_to   = now + timedelta(days=5)
-    count = 0
-    for orders in grouped.values():
-        for order in orders:
-            if order.get("state") != "DATA_FILLING":
-                continue
-            ts = order.get("timeslot", {}).get("timeslot", {}).get("from", "")
-            try:
-                dt = moscow_tz.localize(datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
-                if now <= dt <= date_to:
-                    count += 1
-            except Exception:
-                pass
-
-    if count == 0:
-        await call.message.edit_text(
-            "📭 Нет заявок DATA_FILLING с датой поставки в ближайшие 5 дней.",
-            reply_markup=main_menu()
+        # Шаг 6-7: создать заявку
+        log.info("\n--- ШАГ 6-7: Создание заявки из черновика ---")
+        order_ids = await create_supply_from_draft(
+            session,
+            draft_id=draft_id,
+            placement_warehouse_id=placement_wh_id,
+            ts_from=ts_from,
+            ts_to=ts_to
         )
-        return
 
-    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"✅ Да, перенести {count} заявок", callback_data="confirm_reschedule")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")],
-    ])
-    await call.message.edit_text(
-        f"🔄 Найдено заявок DATA_FILLING в ближайшие 5 дней: {count}\n\n"
-        f"Они будут перенесены на случайную дату +15..+27 дней от сегодня, слот 19:00-20:00 МСК.\n\n"
-        f"Продолжить?",
-        reply_markup=confirm_kb
-    )
-
-
-@dp.callback_query(F.data == "confirm_reschedule")
-async def handle_confirm_reschedule(call: CallbackQuery):
-    await call.answer()
-    await call.message.edit_text("⏳ Переношу заявки... Это может занять 1-2 минуты.")
-
-    grouped = _cache.get("grouped")
-    if not grouped:
-        await call.message.edit_text("❌ Данные устарели. Обновите заявки через «Заявки на поставку».",
-                                     reply_markup=main_menu())
-        return
-
-    try:
-        result = await reschedule_near_orders(grouped)
-    except Exception as e:
-        logging.exception("reschedule error")
-        result = f"❌ Ошибка: {e}"
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-    ])
-    # Разбиваем на части если длинный текст
-    if len(result) > 4000:
-        chunks = [result[i:i+4000] for i in range(0, len(result), 4000)]
-        await call.message.edit_text(chunks[0])
-        for chunk in chunks[1:]:
-            await call.message.answer(chunk)
-        await call.message.answer("⬆️ Готово!", reply_markup=back_kb)
-    else:
-        await call.message.edit_text(result, reply_markup=back_kb)
-
-
-
-# ===== ПЕРЕНОС ЗАЯВОК (callback) =====
-@dp.callback_query(F.data == "do_reschedule")
-async def handle_do_reschedule(call: CallbackQuery):
-    await call.answer()
-    await call.message.edit_text(
-        "⏳ Ищу заявки с датой поставки в ближайшие 5 дней и переношу...\n"
-        "Это может занять до 1 минуты."
-    )
-    try:
-        result = await reschedule_near_orders()
-    except Exception as e:
-        result = f"❌ Ошибка: {e}"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Запустить снова",  callback_data="do_reschedule")],
-        [InlineKeyboardButton(text="🏠 Главное меню",     callback_data="main_menu")],
-    ])
-    # Telegram ограничение — 4096 символов
-    if len(result) > 4000:
-        result = result[:4000] + "\n...(обрезано)"
-    await call.message.edit_text(result, reply_markup=kb)
-
-
-# ===== ЗАЯВКИ — ПОКАЗАТЬ СКЛАДЫ/КЛАСТЕРЫ =====
-@dp.callback_query(F.data == "show_supplies")
-async def handle_show_supplies(call: CallbackQuery):
-    await call.answer()
-    await call.message.edit_text("⏳ Загружаю заявки «Заполнение данных»...\nЭто может занять ~1 мин")
-
-    try:
-        grouped = await load_all_orders()
-        _cache["grouped"] = grouped
-    except Exception as e:
-        await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
-        return
-
-    if not grouped:
-        await call.message.edit_text("📭 Заявок со статусом «Заполнение данных» нет.", reply_markup=main_menu())
-        return
-
-    total = sum(len(v) for v in grouped.values())
-    await call.message.edit_text(
-        f"🚚 Заявки «Заполнение данных»: {total}\nВыбери склад или кластер:",
-        reply_markup=dest_menu(grouped)
-    )
-
-
-# ===== ВЫБРАН СКЛАД/КЛАСТЕР =====
-@dp.callback_query(F.data.startswith("dest::"))
-async def handle_dest_select(call: CallbackQuery):
-    await call.answer()
-    dest_key = call.data[6:]
-    grouped  = _cache.get("grouped", {})
-
-    matched_key = None
-    for k in grouped:
-        if k[:50] == dest_key:
-            matched_key = k
-            break
-
-    if not matched_key:
-        await call.message.edit_text("❌ Данные устарели, нажми «Заявки на поставку» снова.", reply_markup=main_menu())
-        return
-
-    orders = grouped[matched_key]
-    label  = get_dest_label(matched_key)
-
-    all_pids = set()
-    for order in orders:
-        for supply in order.get("supplies", []):
-            for item in supply.get("_items", []):
-                pid = item.get("product_id")
-                if pid:
-                    all_pids.add(pid)
-
-    names = await fetch_product_names(list(all_pids)) if all_pids else {}
-    lines = [f"🏭 {label} — заявок: {len(orders)}\n"]
-
-    for order in orders:
-        order_id  = order.get("order_id", "—")
-        order_num = order.get("order_number", "")
-        created   = order.get("created_date", "")[:10]
-        deadline  = (order.get("data_filling_deadline") or "")[:10]
-        ts        = order.get("timeslot", {}).get("timeslot", {})
-        ts_from   = (ts.get("from") or "")[:10]
-
-        lines.append("━━━━━━━━━━━━━━━━━━")
-        lines.append(f"📋 #{order_id} ({order_num})")
-        lines.append(f"📅 Создана: {created}")
-        if ts_from:
-            lines.append(f"🗓 Дата поставки: {ts_from}")
-        if deadline:
-            lines.append(f"⏰ Дедлайн: {deadline}")
-
-        for supply in order.get("supplies", []):
-            items = supply.get("_items", [])
-            if items:
-                lines.append("Товары:")
-                for item in items:
-                    sku  = item.get("sku", "—")
-                    pid  = item.get("product_id")
-                    qty  = item.get("quantity", "—")
-                    name = names.get(pid, item.get("name", "—"))
-                    lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
-        lines.append("")
-
-    text_full = "\n".join(lines)
-    chunks    = [text_full[i:i + 4000] for i in range(0, len(text_full), 4000)]
-    back_kb   = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад к складам", callback_data="back_to_dests")],
-        [InlineKeyboardButton(text="🏠 Главное меню",    callback_data="main_menu")],
-    ])
-
-    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
-    for i, chunk in enumerate(chunks[1:], 1):
-        await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
-    if len(chunks) > 1:
-        await call.message.answer("⬆️ Список выше", reply_markup=back_kb)
-
-
-# ===== НАЗАД К СКЛАДАМ =====
-@dp.callback_query(F.data == "back_to_dests")
-async def handle_back_to_dests(call: CallbackQuery):
-    await call.answer()
-    grouped = _cache.get("grouped", {})
-    if not grouped:
-        await call.message.edit_text("⏳ Данные устарели, перезагружаю...")
-        try:
-            grouped = await load_all_orders()
-            _cache["grouped"] = grouped
-        except Exception as e:
-            await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
-            return
-
-    total = sum(len(v) for v in grouped.values())
-    await call.message.edit_text(
-        f"🚚 Заявки «Заполнение данных»: {total}\nВыбери склад или кластер:",
-        reply_markup=dest_menu(grouped)
-    )
-
-
-# ===== ЗАПУСК =====
-async def main():
-    await dp.start_polling(bot)
+    # Итог
+    print("\n" + "=" * 60)
+    print("✅ ТЕСТ ЗАВЕРШЁН УСПЕШНО")
+    print(f"Кластер:       {TARGET_CLUSTER_NAME} (id={cluster_id})")
+    print(f"SKU:           {SUPER_SKU}")
+    print(f"Количество:    5 шт")
+    print(f"Точка отгрузки: {STAVROPOL_WAREHOUSE_NAME} (id={drop_off_wh_id})")
+    print(f"Тип поставки:  {supply_type}")
+    print(f"Слот:          {ts_from} – {ts_to}")
+    print(f"Заявки (order_ids): {order_ids}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(test_create_voronezh())
