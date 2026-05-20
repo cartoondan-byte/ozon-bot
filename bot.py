@@ -1,4 +1,5 @@
 import asyncio
+import random
 import logging
 import json
 import os
@@ -177,6 +178,94 @@ def get_dest_label(dest_key: str) -> str:
     return dest_key
 
 
+
+# ===== ПЕРЕНОС БЛИЖАЙШИХ ЗАЯВОК =====
+async def reschedule_near_orders() -> str:
+    """Переносит заявки DATA_FILLING с датой поставки в ближайшие 5 дней
+    на случайную дату от +15 до +27 дней от сегодня, слот 19:00-20:00 МСК (16:00-17:00 UTC)."""
+    today    = datetime.now(MOSCOW_TZ).date()
+    date_to  = today + timedelta(days=5)
+    results, errors = [], []
+
+    async with aiohttp.ClientSession() as session:
+        # Берём только DATA_FILLING
+        order_ids = await fetch_supply_order_ids(session)
+        if not order_ids:
+            return "📭 Нет заявок со статусом «Заполнение данных»."
+
+        orders = await fetch_supply_order_details(session, order_ids)
+
+    # Фильтруем: дата поставки от сегодня до сегодня+5
+    near_orders = []
+    for order in orders:
+        ts      = order.get("timeslot", {}).get("timeslot", {})
+        ts_from = ts.get("from", "")
+        if not ts_from:
+            continue
+        try:
+            dt = datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S")
+            dt = MOSCOW_TZ.localize(dt)
+            if today <= dt.date() <= date_to:
+                near_orders.append(order)
+        except Exception:
+            continue
+
+    if not near_orders:
+        return (
+            f"📭 Заявок DATA_FILLING с датой поставки в ближайшие 5 дней нет.\n"
+            f"Всего DATA_FILLING заявок: {len(orders)}"
+        )
+
+    async with aiohttp.ClientSession() as session:
+        for order in near_orders:
+            order_id  = order.get("order_id")
+            order_num = order.get("order_number", str(order_id))
+            try:
+                # Текущая дата поставки
+                ts_from = order["timeslot"]["timeslot"]["from"]
+                cur_dt  = MOSCOW_TZ.localize(datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S"))
+                cur_str = cur_dt.strftime("%d.%m.%Y")
+
+                # Целевая дата: случайно +15..+27 дней от сегодня
+                days_ahead  = random.randint(15, 27)
+                target_date = today + timedelta(days=days_ahead)
+                # 19:00-20:00 МСК = 16:00-17:00 UTC
+                time_from = f"{target_date.strftime('%Y-%m-%d')}T16:00:00Z"
+                time_to   = f"{target_date.strftime('%Y-%m-%d')}T17:00:00Z"
+
+                resp = await ozon_post(
+                    session,
+                    f"{OZON_API_URL}/v1/supply-order/timeslot/update",
+                    {"supply_order_id": order_id, "timeslot": {"from": time_from, "to": time_to}},
+                    retries=3
+                )
+                logging.info(f"timeslot/update #{order_id} → {resp}")
+
+                errs = resp.get("errors") or []
+                if not errs:
+                    results.append(
+                        f"✅ #{order_num}\n"
+                        f"   {cur_str} → {target_date.strftime('%d.%m.%Y')} (+{days_ahead}д)"
+                    )
+                else:
+                    errors.append(f"❌ #{order_num}: {errs}")
+            except Exception as e:
+                logging.exception(f"reschedule #{order_id}: {e}")
+                errors.append(f"❌ #{order_num}: {str(e)[:100]}")
+
+    lines = [
+        f"🔄 Перенос ближайших заявок DATA_FILLING",
+        f"Найдено: {len(near_orders)} заявок (дата поставки сегодня–{date_to.strftime('%d.%m')})",
+        f"Целевое время: 19:00–20:00 МСК\n",
+    ]
+    if results:
+        lines.extend(results)
+    if errors:
+        lines.append("\nОшибки:")
+        lines.extend(errors)
+    return "\n".join(lines)
+
+
 # ===== ЗАГРУЗКА И ГРУППИРОВКА ВСЕХ ЗАЯВОК =====
 async def load_all_orders() -> dict:
     async with aiohttp.ClientSession() as session:
@@ -220,10 +309,108 @@ async def load_all_orders() -> dict:
     return grouped
 
 
+
+# ===== ПЕРЕНОС ТАЙМСЛОТОВ =====
+async def reschedule_near_orders(grouped: dict) -> str:
+    """
+    Переносит заявки DATA_FILLING с датой в ближайшие 5 дней
+    на случайную дату +15..+27 дней, таймслот 19:00-20:00 МСК (= 16:00-17:00 UTC).
+    """
+    moscow_tz = MOSCOW_TZ
+    now        = datetime.now(moscow_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    date_to    = now + timedelta(days=5)
+
+    # Собираем заявки DATA_FILLING с датой в ближайшие 5 дней
+    near_orders = []
+    for orders in grouped.values():
+        for order in orders:
+            if order.get("state") != "DATA_FILLING":
+                continue
+            ts      = order.get("timeslot", {}).get("timeslot", {})
+            ts_from = ts.get("from", "")
+            if not ts_from:
+                continue
+            try:
+                dt = datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S")
+                dt = moscow_tz.localize(dt)
+                if now <= dt <= date_to:
+                    near_orders.append(order)
+            except Exception:
+                continue
+
+    if not near_orders:
+        return "📭 Заявок DATA_FILLING в ближайшие 5 дней не найдено."
+
+    results = []
+    errors  = []
+
+    async with aiohttp.ClientSession() as session:
+        for order in near_orders:
+            order_id = order.get("order_id")
+            order_num = order.get("order_number", str(order_id))
+            try:
+                ts_old = (order.get("timeslot", {}).get("timeslot", {}).get("from", "")[:10])
+
+                # Случайная дата +15..+27 дней от сегодня
+                random_days = random.randint(15, 27)
+                target_date = (now + timedelta(days=random_days)).date()
+
+                # 19:00-20:00 МСК = 16:00-17:00 UTC
+                time_from = f"{target_date.strftime('%Y-%m-%d')}T16:00:00Z"
+                time_to   = f"{target_date.strftime('%Y-%m-%d')}T17:00:00Z"
+
+                resp = await ozon_post(
+                    session,
+                    f"{OZON_API_URL}/v1/supply-order/timeslot/update",
+                    {"supply_order_id": order_id, "timeslot": {"from": time_from, "to": time_to}}
+                )
+                logging.info(f"timeslot/update #{order_id} → {resp}")
+
+                errs = resp.get("errors", [])
+                if not errs:
+                    results.append(
+                        f"✅ {order_num}: {ts_old} → {target_date.strftime('%d.%m')} (+{random_days}д) 19:00-20:00"
+                    )
+                    # Проверяем статус асинхронно если есть operation_id
+                    op_id = resp.get("operation_id", "")
+                    if op_id:
+                        await asyncio.sleep(2)
+                        try:
+                            status = await ozon_post(
+                                session,
+                                f"{OZON_API_URL}/v1/supply-order/timeslot/status",
+                                {"operation_id": op_id}
+                            )
+                            logging.info(f"timeslot/status #{order_id} → {status}")
+                        except Exception:
+                            pass
+                else:
+                    errors.append(f"❌ {order_num}: {errs}")
+
+                await asyncio.sleep(1)  # пауза между запросами
+
+            except Exception as e:
+                logging.warning(f"timeslot update error #{order_id}: {e}")
+                errors.append(f"❌ {order_num}: {e}")
+
+        header = (
+        "🔄 Перенос ближайших заявок DATA_FILLING\n"
+        + f"Найдено: {len(near_orders)} заявок (сегодня–{date_to.strftime('%d.%m')})\n"
+        + "Целевое время: 19:00–20:00 МСК\n"
+    )
+    lines = [header]
+    if results:
+        lines.extend(results)
+    if errors:
+        lines.append("\nОшибки:")
+        lines.extend(errors)
+    return "\n".join(lines)
+
 # ===== ГЛАВНОЕ МЕНЮ =====
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📅 Ближайшие заявки на перенос", callback_data="show_skus")],
+        [InlineKeyboardButton(text="🔄 Перенести ближайшие заявки",  callback_data="do_reschedule")],
         [InlineKeyboardButton(text="🚚 Заявки на поставку",          callback_data="show_supplies")],
     ])
 
@@ -357,6 +544,112 @@ async def handle_show_skus(call: CallbackQuery):
         await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
     if len(chunks) > 1:
         await call.message.answer("⬆️ Список выше", reply_markup=back_kb)
+
+
+
+# ===== ПЕРЕНОС — ОБРАБОТЧИК =====
+@dp.callback_query(F.data == "do_reschedule")
+async def handle_do_reschedule(call: CallbackQuery):
+    await call.answer()
+
+    grouped = _cache.get("grouped")
+    if not grouped:
+        await call.message.edit_text("⏳ Загружаю заявки...")
+        try:
+            grouped = await load_all_orders()
+            _cache["grouped"] = grouped
+        except Exception as e:
+            await call.message.edit_text(f"❌ Ошибка загрузки:\n{e}", reply_markup=main_menu())
+            return
+
+    # Подсчитаем сколько заявок попадает под критерий
+    moscow_tz = MOSCOW_TZ
+    now       = datetime.now(moscow_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    date_to   = now + timedelta(days=5)
+    count = 0
+    for orders in grouped.values():
+        for order in orders:
+            if order.get("state") != "DATA_FILLING":
+                continue
+            ts = order.get("timeslot", {}).get("timeslot", {}).get("from", "")
+            try:
+                dt = moscow_tz.localize(datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+                if now <= dt <= date_to:
+                    count += 1
+            except Exception:
+                pass
+
+    if count == 0:
+        await call.message.edit_text(
+            "📭 Нет заявок DATA_FILLING с датой поставки в ближайшие 5 дней.",
+            reply_markup=main_menu()
+        )
+        return
+
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Да, перенести {count} заявок", callback_data="confirm_reschedule")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")],
+    ])
+    await call.message.edit_text(
+        f"🔄 Найдено заявок DATA_FILLING в ближайшие 5 дней: {count}\n\n"
+        f"Они будут перенесены на случайную дату +15..+27 дней от сегодня, слот 19:00-20:00 МСК.\n\n"
+        f"Продолжить?",
+        reply_markup=confirm_kb
+    )
+
+
+@dp.callback_query(F.data == "confirm_reschedule")
+async def handle_confirm_reschedule(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text("⏳ Переношу заявки... Это может занять 1-2 минуты.")
+
+    grouped = _cache.get("grouped")
+    if not grouped:
+        await call.message.edit_text("❌ Данные устарели. Обновите заявки через «Заявки на поставку».",
+                                     reply_markup=main_menu())
+        return
+
+    try:
+        result = await reschedule_near_orders(grouped)
+    except Exception as e:
+        logging.exception("reschedule error")
+        result = f"❌ Ошибка: {e}"
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    # Разбиваем на части если длинный текст
+    if len(result) > 4000:
+        chunks = [result[i:i+4000] for i in range(0, len(result), 4000)]
+        await call.message.edit_text(chunks[0])
+        for chunk in chunks[1:]:
+            await call.message.answer(chunk)
+        await call.message.answer("⬆️ Готово!", reply_markup=back_kb)
+    else:
+        await call.message.edit_text(result, reply_markup=back_kb)
+
+
+
+# ===== ПЕРЕНОС ЗАЯВОК (callback) =====
+@dp.callback_query(F.data == "do_reschedule")
+async def handle_do_reschedule(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text(
+        "⏳ Ищу заявки с датой поставки в ближайшие 5 дней и переношу...\n"
+        "Это может занять до 1 минуты."
+    )
+    try:
+        result = await reschedule_near_orders()
+    except Exception as e:
+        result = f"❌ Ошибка: {e}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Запустить снова",  callback_data="do_reschedule")],
+        [InlineKeyboardButton(text="🏠 Главное меню",     callback_data="main_menu")],
+    ])
+    # Telegram ограничение — 4096 символов
+    if len(result) > 4000:
+        result = result[:4000] + "\n...(обрезано)"
+    await call.message.edit_text(result, reply_markup=kb)
 
 
 # ===== ЗАЯВКИ — ПОКАЗАТЬ СКЛАДЫ/КЛАСТЕРЫ =====
