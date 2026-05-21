@@ -701,17 +701,16 @@ async def find_best_timeslot(session: aiohttp.ClientSession,
     date_from = today + timedelta(days=day_min)
     date_to   = today + timedelta(days=day_max)
 
+    cluster_wh: dict = {"macrolocal_cluster_id": int(cluster_id)}
+    if storage_warehouse_id:
+        cluster_wh["storage_warehouse_id"] = storage_warehouse_id
+
     payload = {
         "draft_id":    draft_id,
         "date_from":   date_from.strftime("%Y-%m-%d"),
         "date_to":     date_to.strftime("%Y-%m-%d"),
         "supply_type": supply_type,
-        "selected_cluster_warehouses": [
-            {
-                "macrolocal_cluster_id": int(cluster_id),
-                "storage_warehouse_id":  storage_warehouse_id,
-            }
-        ],
+        "selected_cluster_warehouses": [cluster_wh],
     }
     logging.info(f"timeslot/info payload: {json.dumps(payload, ensure_ascii=False)}")
     data = await ozon_post(session, f"{OZON_API_URL}/v2/draft/timeslot/info", payload)
@@ -815,46 +814,45 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
             if any(m not in ("UNSPECIFIED", "") for m in msgs):
                 raise Exception(f"Ошибки черновика: {msgs}")
 
-        # ── 3. Найти storage_warehouse_id ─────────────────────────────────
-        # В v2 структура: clusters[].warehouses[].storage_warehouse.warehouse_id
+        # ── 3. Найти bundle_id и storage_warehouse_id ────────────────────────
+        # CROSSDOCK: storage_warehouse = null, нужен bundle_id
+        # DIRECT:    storage_warehouse.warehouse_id есть
+        bundle_id     = None
         storage_wh_id = None
         for cl in info.get("clusters", []):
             for wh in cl.get("warehouses", []):
-                avail = wh.get("availability_status", {})
-                # Берём доступный склад; если нет — берём первый как fallback
-                wh_id = wh.get("storage_warehouse", {}).get("warehouse_id")
-                if wh_id:
-                    if avail.get("state", "") in ("", "UNSPECIFIED") or storage_wh_id is None:
-                        storage_wh_id = wh_id
-                    if avail.get("state", "") == "AVAILABLE":
-                        storage_wh_id = wh_id
-                        break
-            if storage_wh_id:
-                break
+                avail  = wh.get("availability_status", {})
+                state  = avail.get("state", "")
+                b_id   = wh.get("bundle_id")
+                sw     = wh.get("storage_warehouse") or {}
+                sw_id  = sw.get("warehouse_id")
+                # Предпочитаем FULL_AVAILABLE, иначе берём первый попавшийся
+                if b_id and (bundle_id is None or state == "FULL_AVAILABLE"):
+                    bundle_id = b_id
+                if sw_id and (storage_wh_id is None or state == "FULL_AVAILABLE"):
+                    storage_wh_id = sw_id
 
-        if not storage_wh_id:
-            raise Exception(f"Не найден storage_warehouse_id в info: {json.dumps(info)[:300]}")
-        logging.info(f"storage_warehouse_id={storage_wh_id}")
+        logging.info(f"bundle_id={bundle_id}, storage_wh_id={storage_wh_id}")
 
         # ── 4. Получить таймслот (/v2/draft/timeslot/info) ─────────────────
+        # Для CROSSDOCK передаём storage_warehouse_id=0 (не используется)
         ts_from, ts_to = await find_best_timeslot(
             session,
             draft_id=draft_id,
             cluster_id=cluster_id,
-            storage_warehouse_id=storage_wh_id,
+            storage_warehouse_id=storage_wh_id or 0,
             supply_type="CROSSDOCK",
         )
         logging.info(f"Выбран слот: {ts_from} – {ts_to}")
 
         # ── 5. Создать заявку (/v2/draft/supply/create) ────────────────────
+        cluster_wh: dict = {"macrolocal_cluster_id": int(cluster_id)}
+        if storage_wh_id:
+            cluster_wh["storage_warehouse_id"] = storage_wh_id
+
         supply_payload = {
             "draft_id": draft_id,
-            "selected_cluster_warehouses": [
-                {
-                    "macrolocal_cluster_id": int(cluster_id),
-                    "storage_warehouse_id":  storage_wh_id,
-                }
-            ],
+            "selected_cluster_warehouses": [cluster_wh],
             "timeslot": {
                 "from_in_timezone": ts_from,
                 "to_in_timezone":   ts_to,
