@@ -534,24 +534,27 @@ async def fetch_all_ozon_clusters(session: aiohttp.ClientSession) -> list[dict]:
     return data.get("clusters", [])
 
 
-# ===== СУПЕРПОСТАВКИ: найти склад продавца (PICKUP = курьер Ozon) =====
-async def find_seller_warehouse_id(session: aiohttp.ClientSession) -> int:
+# ===== СУПЕРПОСТАВКИ: найти точку отгрузки СТАВРОПОЛЬ_АППЗ_2 (DROPOFF) =====
+async def find_drop_off_warehouse_id(session: aiohttp.ClientSession) -> int:
     """
-    Возвращает первый активный seller_warehouse_id из /v1/warehouse/fbo/seller/list.
-    Используется для типа поставки DIRECT (курьер Ozon забирает со склада продавца).
+    Ищет точку отгрузки СТАВРОПОЛЬ_АППЗ_2 через /v1/cluster/list.
+    Для типа поставки CROSSDOCK — товар сдаётся в пункт приёма Ozon.
+    Возвращает warehouse_id точки.
     """
     try:
-        data = await ozon_post(session, f"{OZON_API_URL}/v1/warehouse/fbo/seller/list", {})
-        warehouses = data.get("warehouses", [])
-        for wh in warehouses:
-            wh_id = wh.get("warehouse_id") or wh.get("id")
-            if wh_id:
-                name = wh.get("name", "")
-                logging.info(f"Склад продавца найден: id={wh_id} name={name}")
-                return int(wh_id)
-        raise Exception(f"Нет складов продавца в ответе: {data}")
+        data = await ozon_post(session, f"{OZON_API_URL}/v1/cluster/list",
+                               {"cluster_type": "CLUSTER_TYPE_OZON"})
+        for cluster in data.get("clusters", []):
+            for lc in cluster.get("logistic_clusters", []):
+                for wh in lc.get("warehouses", []):
+                    name = wh.get("name", "")
+                    if STAVROPOL_WAREHOUSE_NAME.lower() in name.lower():
+                        wh_id = wh.get("warehouse_id")
+                        logging.info(f"Точка отгрузки найдена: id={wh_id} name={name}")
+                        return int(wh_id)
+        raise Exception(f"Точка '{STAVROPOL_WAREHOUSE_NAME}' не найдена в cluster/list")
     except Exception as e:
-        raise Exception(f"Ошибка получения склада продавца: {e}")
+        raise Exception(f"Ошибка поиска точки отгрузки: {e}")
 
 
 # ===== СУПЕРПОСТАВКИ: получить Super-товары =====
@@ -683,16 +686,17 @@ async def find_best_timeslot(session: aiohttp.ClientSession,
 async def create_supply_for_cluster(session: aiohttp.ClientSession,
                                      cluster_id: str,
                                      cluster_name_str: str,
-                                     seller_warehouse_id: int,
+                                     drop_off_warehouse_id: int,
                                      sku: int,
                                      sku_name: str) -> dict:
     """
     Создаёт одну заявку (1 SKU, 5 шт) для указанного кластера.
-    Использует новое v2 API:
-      /v1/draft/direct/create  → draft_id
-      /v2/draft/create/info    → polling + storage_warehouse_id
-      /v2/draft/timeslot/info  → таймслоты
-      /v2/draft/supply/create  → создание заявки (возвращает draft_id, не operation_id)
+    Тип поставки: CROSSDOCK — товар сдаётся в точку СТАВРОПОЛЬ_АППЗ_2.
+    Использует v2 API:
+      /v1/draft/crossdock/create → draft_id
+      /v2/draft/create/info      → polling + storage_warehouse_id
+      /v2/draft/timeslot/info    → таймслоты
+      /v2/draft/supply/create    → создание заявки
       /v2/draft/supply/create/status → polling по draft_id
     """
     result = {
@@ -707,20 +711,23 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
     }
 
     try:
-        # ── 1. Создать черновик DIRECT ──────────────────────────────────────
+        # ── 1. Создать черновик CROSSDOCK ───────────────────────────────────
         draft_payload = {
             "cluster_info": {
                 "items": [{"sku": sku, "quantity": 5}],
                 "macrolocal_cluster_id": int(cluster_id),
             },
             "delivery_info": {
-                "type":               "PICKUP",
-                "seller_warehouse_id": seller_warehouse_id,
+                "type": "DROPOFF",
+                "drop_off_warehouse": {
+                    "warehouse_id":   drop_off_warehouse_id,
+                    "warehouse_type": "ORDERS_RECEIVING_POINT",
+                },
             },
         }
-        logging.info(f"direct/create payload: {json.dumps(draft_payload, ensure_ascii=False)}")
+        logging.info(f"crossdock/create payload: {json.dumps(draft_payload, ensure_ascii=False)}")
         draft_resp = await ozon_post_draft(
-            session, f"{OZON_API_URL}/v1/draft/direct/create", draft_payload
+            session, f"{OZON_API_URL}/v1/draft/crossdock/create", draft_payload
         )
         draft_id = draft_resp.get("draft_id")
         if not draft_id:
@@ -774,7 +781,7 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
             draft_id=draft_id,
             cluster_id=cluster_id,
             storage_warehouse_id=storage_wh_id,
-            supply_type="DIRECT",
+            supply_type="CROSSDOCK",
         )
         logging.info(f"Выбран слот: {ts_from} – {ts_to}")
 
@@ -791,7 +798,7 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
                 "from_in_timezone": ts_from,
                 "to_in_timezone":   ts_to,
             },
-            "supply_type": "DIRECT",
+            "supply_type": "CROSSDOCK",
         }
         logging.info(f"supply/create payload: {json.dumps(supply_payload, ensure_ascii=False)}")
         supply_resp = await ozon_post(
@@ -850,12 +857,12 @@ async def run_super_supply_test() -> str:
     lines = ["🧪 ТЕСТ: Создание заявки в кластер Воронеж\n"]
 
     async with aiohttp.ClientSession() as session:
-        # Найти склад продавца
+        # Найти точку отгрузки СТАВРОПОЛЬ_АППЗ_2
         try:
-            seller_wh_id = await find_seller_warehouse_id(session)
-            lines.append(f"📦 Склад продавца: id={seller_wh_id} (тип поставки: DIRECT)")
+            drop_off_wh_id = await find_drop_off_warehouse_id(session)
+            lines.append(f"📦 Точка отгрузки: {STAVROPOL_WAREHOUSE_NAME} (id={drop_off_wh_id})")
         except Exception as e:
-            return f"❌ Не найден склад продавца: {e}"
+            return f"❌ Не найдена точка отгрузки: {e}"
 
         # Найти Super-товары
         lines.append("🔍 Ищу Super-товары...")
@@ -890,7 +897,7 @@ async def run_super_supply_test() -> str:
             session,
             cluster_id=cluster_id,
             cluster_name_str=cluster_nm,
-            seller_warehouse_id=seller_wh_id,
+            drop_off_warehouse_id=drop_off_wh_id,
             sku=sku,
             sku_name=sku_name
         )
@@ -920,12 +927,12 @@ async def run_super_supply_all() -> str:
     lines = ["🚀 Суперпоставки: создание заявок во все кластеры\n"]
 
     async with aiohttp.ClientSession() as session:
-        # Найти склад продавца
+        # Найти точку отгрузки СТАВРОПОЛЬ_АППЗ_2
         try:
-            seller_wh_id = await find_seller_warehouse_id(session)
-            lines.append(f"📦 Склад продавца: id={seller_wh_id} (тип: DIRECT)")
+            drop_off_wh_id = await find_drop_off_warehouse_id(session)
+            lines.append(f"📦 Точка отгрузки: {STAVROPOL_WAREHOUSE_NAME} (id={drop_off_wh_id})")
         except Exception as e:
-            return f"❌ Не найден склад продавца: {e}"
+            return f"❌ Не найдена точка отгрузки: {e}"
 
         # Найти Super-товары
         super_skus = await fetch_super_skus(session)
@@ -966,7 +973,7 @@ async def run_super_supply_all() -> str:
                 session,
                 cluster_id=cluster_id,
                 cluster_name_str=cluster_nm,
-                seller_warehouse_id=seller_wh_id,
+                drop_off_warehouse_id=drop_off_wh_id,
                 sku=sku,
                 sku_name=sku_name
             )
