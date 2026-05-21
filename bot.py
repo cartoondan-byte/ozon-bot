@@ -522,14 +522,32 @@ async def reschedule_near_orders(grouped: dict) -> str:
 
 # ===== СУПЕРПОСТАВКИ: получить все кластеры =====
 async def fetch_all_ozon_clusters(session: aiohttp.ClientSession) -> list[dict]:
+    """
+    Возвращает плоский список кластеров с полями id/macrolocal_cluster_id и name.
+    API возвращает структуру: clusters[].logistic_clusters[].{macrolocal_cluster_id, name}
+    """
     data = await ozon_post(session, f"{OZON_API_URL}/v1/cluster/list",
                            {"cluster_type": "CLUSTER_TYPE_OZON"})
-    clusters = data.get("clusters", [])
+    result = []
+    for top in data.get("clusters", []):
+        # Попробуем сначала верхний уровень
+        top_id   = top.get("macrolocal_cluster_id") or top.get("id")
+        top_name = top.get("name", "")
+        if top_id and top_name:
+            result.append({"macrolocal_cluster_id": top_id, "name": top_name})
+        # Затем вложенные logistic_clusters
+        for lc in top.get("logistic_clusters", []):
+            lc_id   = lc.get("macrolocal_cluster_id") or lc.get("id")
+            lc_name = lc.get("name", top_name)
+            if lc_id and lc_name and lc_id != top_id:
+                result.append({"macrolocal_cluster_id": lc_id, "name": lc_name})
+
     # Логируем Воронеж для диагностики
-    for c in clusters:
+    for c in result:
         if "воронеж" in c.get("name", "").lower():
-            logging.info(f"ВОРОНЕЖ cluster raw: {json.dumps(c, ensure_ascii=False)[:600]}")
-    return clusters
+            logging.info(f"ВОРОНЕЖ cluster: {c}")
+    logging.info(f"fetch_all_ozon_clusters: итого {len(result)} кластеров")
+    return result
 
 
 # ===== СУПЕРПОСТАВКИ: найти точку отгрузки СТАВРОПОЛЬ_АППЗ_2 (DROPOFF) =====
