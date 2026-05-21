@@ -77,6 +77,24 @@ async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, ret
     raise Exception(f"Превышен лимит запросов к {url}")
 
 
+# ===== POST специально для draft/create (агрессивный backoff) =====
+async def ozon_post_draft(session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
+    """POST с экспоненциальным backoff для эндпоинтов с жёстким rate limit."""
+    waits = [5, 10, 20, 30, 60, 60, 60]
+    for attempt, wait in enumerate(waits):
+        await asyncio.sleep(wait)  # всегда ждём перед запросом
+        async with session.post(url, headers=ozon_headers(), json=payload) as resp:
+            raw = await resp.text()
+            logging.info(f"POST {url} → {resp.status} | {raw[:200]}")
+            if resp.status == 429:
+                logging.warning(f"draft 429, жду {waits[min(attempt+1, len(waits)-1)]}с (attempt {attempt+1})")
+                continue
+            if resp.status != 200:
+                raise Exception(f"HTTP {resp.status} [{url}]: {raw[:200]}")
+            return json.loads(raw)
+    raise Exception(f"Превышен лимит запросов к {url}")
+
+
 # ===== POLLING =====
 async def poll(session: aiohttp.ClientSession, url: str, payload: dict,
                success_statuses: list, fail_statuses: list,
@@ -662,8 +680,7 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
         if supply_type == "CREATE_TYPE_CROSSDOCK":
             payload["drop_off_point_warehouse_id"] = drop_off_wh_id
 
-        await asyncio.sleep(2)  # пауза перед draft/create чтобы избежать 429
-        resp = await ozon_post(session, f"{OZON_API_URL}/v1/draft/create", payload)
+        resp = await ozon_post_draft(session, f"{OZON_API_URL}/v1/draft/create", payload)
         operation_id = resp.get("operation_id")
         if not operation_id:
             raise Exception(f"draft/create не вернул operation_id: {resp}")
