@@ -1099,6 +1099,405 @@ async def run_super_supply_all(chat_id: int) -> None:
         await send(chunk)
 
 
+# ===== ГЛАВНОЕ МЕНЮ =====
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Ближайшие заявки на перенос", callback_data="show_skus")],
+        [InlineKeyboardButton(text="🔄 Перенести ближайшие заявки",  callback_data="do_reschedule")],
+        [InlineKeyboardButton(text="🚚 Заявки на поставку",          callback_data="show_supplies")],
+        [InlineKeyboardButton(text="➕ Создание заявок",             callback_data="create_orders_menu")],
+    ])
+
+
+# ===== МЕНЮ СКЛАДОВ/КЛАСТЕРОВ =====
+def dest_menu(grouped: dict) -> InlineKeyboardMarkup:
+    buttons = []
+    for dest_key, orders in sorted(grouped.items(), key=lambda x: get_dest_label(x[0])):
+        label = f"{get_dest_label(dest_key)} ({len(orders)})"
+        buttons.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"dest::{dest_key[:50]}"
+        )])
+    buttons.append([InlineKeyboardButton(text="🔄 Обновить",     callback_data="show_supplies")])
+    buttons.append([InlineKeyboardButton(text="◀️ Главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+# ===== СТАРТ =====
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    chat_id    = message.chat.id
+    message_id = message.message_id
+    for mid in range(message_id - 1, max(message_id - 50, 0), -1):
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+    await bot.send_message(chat_id=chat_id, text="Привет! Выбери действие:", reply_markup=main_menu())
+
+
+# ===== ГЛАВНОЕ МЕНЮ (callback) =====
+@dp.callback_query(F.data == "main_menu")
+async def handle_main_menu(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text("Выбери действие:", reply_markup=main_menu())
+
+
+# ===== БЛИЖАЙШИЕ ЗАЯВКИ НА ПЕРЕНОС =====
+@dp.callback_query(F.data == "show_skus")
+async def handle_show_skus(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text("⏳ Ищу заявки с датой поставки в ближайшие 5 дней...")
+
+    grouped = _cache.get("grouped")
+    if not grouped:
+        try:
+            grouped = await load_all_orders()
+            _cache["grouped"] = grouped
+        except Exception as e:
+            await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
+            return
+
+    all_orders = [order for orders in grouped.values() for order in orders]
+    now        = datetime.now(MOSCOW_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    date_to    = now + timedelta(days=5)
+
+    near_orders = []
+    for order in all_orders:
+        ts      = order.get("timeslot", {}).get("timeslot", {})
+        ts_from = ts.get("from", "")
+        if not ts_from:
+            continue
+        try:
+            dt = datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S")
+            dt = MOSCOW_TZ.localize(dt)
+            if now <= dt <= date_to:
+                near_orders.append((dt, order))
+        except Exception:
+            continue
+
+    near_orders.sort(key=lambda x: x[0])
+
+    if not near_orders:
+        await call.message.edit_text(
+            "📭 Заявок с датой поставки в ближайшие 5 дней не найдено.",
+            reply_markup=main_menu()
+        )
+        return
+
+    all_pids = set()
+    for _, order in near_orders:
+        for supply in order.get("supplies", []):
+            for item in supply.get("_items", []):
+                pid = item.get("product_id")
+                if pid:
+                    all_pids.add(pid)
+
+    names = await fetch_product_names(list(all_pids)) if all_pids else {}
+    lines = [f"📅 Заявок в ближайшие 5 дней: {len(near_orders)}\n"]
+
+    for dt, order in near_orders:
+        order_id  = order.get("order_id", "—")
+        order_num = order.get("order_number", "")
+        created   = order.get("created_date", "")[:10]
+        deadline  = (order.get("data_filling_deadline") or "")[:10]
+        dest      = get_dest_label(get_dest_key(order))
+
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📋 #{order_id} ({order_num})")
+        lines.append(f"🏭 Назначение: {dest}")
+        lines.append(f"🗓 Дата поставки: {dt.strftime('%Y-%m-%d %H:%M')}")
+        lines.append(f"📅 Создана: {created}")
+        if deadline:
+            lines.append(f"⏰ Дедлайн: {deadline}")
+
+        for supply in order.get("supplies", []):
+            items = supply.get("_items", [])
+            if items:
+                lines.append("Товары:")
+                for item in items:
+                    sku  = item.get("sku", "—")
+                    pid  = item.get("product_id")
+                    qty  = item.get("quantity", "—")
+                    name = names.get(pid, item.get("name", "—"))
+                    lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
+        lines.append("")
+
+    text_full = "\n".join(lines)
+    chunks    = [text_full[i:i + 4000] for i in range(0, len(text_full), 4000)]
+    back_kb   = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+
+    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
+    for i, chunk in enumerate(chunks[1:], 1):
+        await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
+    if len(chunks) > 1:
+        await call.message.answer("⬆️ Список выше", reply_markup=back_kb)
+
+
+# ===== ПЕРЕНОС — ОБРАБОТЧИК =====
+@dp.callback_query(F.data == "do_reschedule")
+async def handle_do_reschedule(call: CallbackQuery):
+    await call.answer()
+
+    grouped = _cache.get("grouped")
+    if not grouped:
+        await call.message.edit_text("⏳ Загружаю заявки...")
+        try:
+            grouped = await load_all_orders()
+            _cache["grouped"] = grouped
+        except Exception as e:
+            await call.message.edit_text(f"❌ Ошибка загрузки:\n{e}", reply_markup=main_menu())
+            return
+
+    moscow_tz = MOSCOW_TZ
+    now       = datetime.now(moscow_tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    date_to   = now + timedelta(days=5)
+    count = 0
+    for orders in grouped.values():
+        for order in orders:
+            if order.get("state") != "DATA_FILLING":
+                continue
+            ts = order.get("timeslot", {}).get("timeslot", {}).get("from", "")
+            try:
+                dt = moscow_tz.localize(datetime.strptime(ts[:19], "%Y-%m-%dT%H:%M:%S"))
+                if now <= dt <= date_to:
+                    count += 1
+            except Exception:
+                pass
+
+    if count == 0:
+        await call.message.edit_text(
+            "📭 Нет заявок DATA_FILLING с датой поставки в ближайшие 5 дней.",
+            reply_markup=main_menu()
+        )
+        return
+
+    confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Да, перенести {count} заявок", callback_data="confirm_reschedule")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")],
+    ])
+    await call.message.edit_text(
+        f"🔄 Найдено заявок DATA_FILLING в ближайшие 5 дней: {count}\n\n"
+        f"Они будут перенесены на случайную дату +15..+27 дней от сегодня, слот 19:00-20:00 МСК.\n\n"
+        f"Продолжить?",
+        reply_markup=confirm_kb
+    )
+
+
+@dp.callback_query(F.data == "confirm_reschedule")
+async def handle_confirm_reschedule(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text("⏳ Переношу заявки... Это может занять 1-2 минуты.")
+
+    grouped = _cache.get("grouped")
+    if not grouped:
+        await call.message.edit_text("❌ Данные устарели. Обновите заявки через «Заявки на поставку».",
+                                     reply_markup=main_menu())
+        return
+
+    try:
+        result = await reschedule_near_orders(grouped)
+    except Exception as e:
+        logging.exception("reschedule error")
+        result = f"❌ Ошибка: {e}"
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    if len(result) > 4000:
+        chunks = [result[i:i+4000] for i in range(0, len(result), 4000)]
+        await call.message.edit_text(chunks[0])
+        for chunk in chunks[1:]:
+            await call.message.answer(chunk)
+        await call.message.answer("⬆️ Готово!", reply_markup=back_kb)
+    else:
+        await call.message.edit_text(result, reply_markup=back_kb)
+
+
+# ===== ПЕРЕНОС ЗАЯВОК (callback) =====
+@dp.callback_query(F.data == "do_reschedule")
+async def handle_do_reschedule(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text(
+        "⏳ Ищу заявки с датой поставки в ближайшие 5 дней и переношу...\n"
+        "Это может занять до 1 минуты."
+    )
+    try:
+        result = await reschedule_near_orders()
+    except Exception as e:
+        result = f"❌ Ошибка: {e}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Запустить снова",  callback_data="do_reschedule")],
+        [InlineKeyboardButton(text="🏠 Главное меню",     callback_data="main_menu")],
+    ])
+    if len(result) > 4000:
+        result = result[:4000] + "\n...(обрезано)"
+    await call.message.edit_text(result, reply_markup=kb)
+
+
+# ===== ЗАЯВКИ — ПОКАЗАТЬ СКЛАДЫ/КЛАСТЕРЫ =====
+@dp.callback_query(F.data == "show_supplies")
+async def handle_show_supplies(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text("⏳ Загружаю заявки «Заполнение данных»...\nЭто может занять ~1 мин")
+
+    try:
+        grouped = await load_all_orders()
+        _cache["grouped"] = grouped
+    except Exception as e:
+        await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
+        return
+
+    if not grouped:
+        await call.message.edit_text("📭 Заявок со статусом «Заполнение данных» нет.", reply_markup=main_menu())
+        return
+
+    total = sum(len(v) for v in grouped.values())
+    await call.message.edit_text(
+        f"🚚 Заявки «Заполнение данных»: {total}\nВыбери склад или кластер:",
+        reply_markup=dest_menu(grouped)
+    )
+
+
+# ===== ВЫБРАН СКЛАД/КЛАСТЕР =====
+@dp.callback_query(F.data.startswith("dest::"))
+async def handle_dest_select(call: CallbackQuery):
+    await call.answer()
+    dest_key = call.data[6:]
+    grouped  = _cache.get("grouped", {})
+
+    matched_key = None
+    for k in grouped:
+        if k[:50] == dest_key:
+            matched_key = k
+            break
+
+    if not matched_key:
+        await call.message.edit_text("❌ Данные устарели, нажми «Заявки на поставку» снова.", reply_markup=main_menu())
+        return
+
+    orders = grouped[matched_key]
+    label  = get_dest_label(matched_key)
+
+    all_pids = set()
+    for order in orders:
+        for supply in order.get("supplies", []):
+            for item in supply.get("_items", []):
+                pid = item.get("product_id")
+                if pid:
+                    all_pids.add(pid)
+
+    names = await fetch_product_names(list(all_pids)) if all_pids else {}
+    lines = [f"🏭 {label} — заявок: {len(orders)}\n"]
+
+    for order in orders:
+        order_id  = order.get("order_id", "—")
+        order_num = order.get("order_number", "")
+        created   = order.get("created_date", "")[:10]
+        deadline  = (order.get("data_filling_deadline") or "")[:10]
+        ts        = order.get("timeslot", {}).get("timeslot", {})
+        ts_from   = (ts.get("from") or "")[:10]
+
+        lines.append("━━━━━━━━━━━━━━━━━━")
+        lines.append(f"📋 #{order_id} ({order_num})")
+        lines.append(f"📅 Создана: {created}")
+        if ts_from:
+            lines.append(f"🗓 Дата поставки: {ts_from}")
+        if deadline:
+            lines.append(f"⏰ Дедлайн: {deadline}")
+
+        for supply in order.get("supplies", []):
+            items = supply.get("_items", [])
+            if items:
+                lines.append("Товары:")
+                for item in items:
+                    sku  = item.get("sku", "—")
+                    pid  = item.get("product_id")
+                    qty  = item.get("quantity", "—")
+                    name = names.get(pid, item.get("name", "—"))
+                    lines.append(f"  • SKU: {sku} | {name} | кол-во: {qty}")
+        lines.append("")
+
+    text_full = "\n".join(lines)
+    chunks    = [text_full[i:i + 4000] for i in range(0, len(text_full), 4000)]
+    back_kb   = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад к складам", callback_data="back_to_dests")],
+        [InlineKeyboardButton(text="🏠 Главное меню",    callback_data="main_menu")],
+    ])
+
+    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
+    for i, chunk in enumerate(chunks[1:], 1):
+        await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
+    if len(chunks) > 1:
+        await call.message.answer("⬆️ Список выше", reply_markup=back_kb)
+
+
+# ===== НАЗАД К СКЛАДАМ =====
+@dp.callback_query(F.data == "back_to_dests")
+async def handle_back_to_dests(call: CallbackQuery):
+    await call.answer()
+    grouped = _cache.get("grouped", {})
+    if not grouped:
+        await call.message.edit_text("⏳ Данные устарели, перезагружаю...")
+        try:
+            grouped = await load_all_orders()
+            _cache["grouped"] = grouped
+        except Exception as e:
+            await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
+            return
+
+    total = sum(len(v) for v in grouped.values())
+    await call.message.edit_text(
+        f"🚚 Заявки «Заполнение данных»: {total}\nВыбери склад или кластер:",
+        reply_markup=dest_menu(grouped)
+    )
+
+
+# ===== МЕНЮ СОЗДАНИЯ ЗАЯВОК =====
+@dp.callback_query(F.data == "create_orders_menu")
+async def handle_create_orders_menu(call: CallbackQuery):
+    await call.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Суперпоставки (тест — Воронеж)", callback_data="super_supply_test")],
+        [InlineKeyboardButton(text="🚀 Суперпоставки (все кластеры)",   callback_data="super_supply_confirm")],
+        [InlineKeyboardButton(text="◀️ Главное меню",                   callback_data="main_menu")],
+    ])
+    await call.message.edit_text(
+        "➕ Создание заявок\n\nВыбери режим:",
+        reply_markup=kb
+    )
+
+
+# ===== СУПЕРПОСТАВКИ: ТЕСТ (Воронеж) =====
+@dp.callback_query(F.data == "super_supply_test")
+async def handle_super_supply_test(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text("⏳ Запускаю тест: создаю заявку в кластер Воронеж...")
+    try:
+        result = await run_super_supply_test()
+    except Exception as e:
+        logging.exception("super_supply_test error")
+        result = f"❌ Ошибка: {e}"
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="create_orders_menu")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    chunks = [result[i:i + 4000] for i in range(0, len(result), 4000)]
+    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
+    for i, chunk in enumerate(chunks[1:], 1):
+        await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
+    if len(chunks) > 1:
+        await call.message.answer("⬆️ Результат выше", reply_markup=back_kb)
+
+
+
 # ===== СУПЕРПОСТАВКИ: ПОДТВЕРЖДЕНИЕ (все кластеры) =====
 @dp.callback_query(F.data == "super_supply_confirm")
 async def handle_super_supply_confirm(call: CallbackQuery):
@@ -1140,6 +1539,7 @@ async def handle_super_supply_run(call: CallbackQuery):
     except Exception as e:
         logging.exception("super_supply_run error")
         await bot.send_message(call.message.chat.id, f"❌ Критическая ошибка: {e}")
+
 
 
 # ===== ЗАПУСК =====
