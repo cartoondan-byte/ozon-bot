@@ -717,6 +717,7 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
                 "items": [{"sku": sku, "quantity": 5}],
                 "macrolocal_cluster_id": int(cluster_id),
             },
+            "deletion_sku_mode": "PARTIAL",
             "delivery_info": {
                 "type": "DROPOFF",
                 "drop_off_warehouse": {
