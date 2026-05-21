@@ -680,6 +680,7 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
         if supply_type == "CREATE_TYPE_CROSSDOCK":
             payload["drop_off_point_warehouse_id"] = drop_off_wh_id
 
+        logging.info(f"draft/create payload: {json.dumps(payload, ensure_ascii=False)}")
         resp = await ozon_post_draft(session, f"{OZON_API_URL}/v1/draft/create", payload)
         operation_id = resp.get("operation_id")
         if not operation_id:
