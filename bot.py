@@ -84,13 +84,7 @@ async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, ret
 
 # ===== POST специально для draft/create (1 раз в минуту лимит) =====
 async def ozon_post_draft(session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
-    """
-    /v1/draft/create имеет лимит 1 запрос в минуту на весь аккаунт.
-    Используем глобальный семафор (_draft_semaphore=1), чтобы никогда не
-    отправлять два запроса параллельно, плюс гарантируем паузу ≥65 с
-    после предыдущего успешного вызова.
-    Экспоненциальный backoff при 429: 65 → 90 → 120 → 150 → 180 → 210 → 240 → 270 → 300 → 330 с
-    """
+    """\n    /v1/draft/create имеет лимит 1 запрос в минуту на весь аккаунт.\n    Используем глобальный семафор (_draft_semaphore=1), чтобы никогда не\n    отправлять два запроса параллельно, плюс гарантируем паузу ≥65 с\n    после предыдущего успешного вызова.\n    Экспоненциальный backoff при 429: 65 → 90 → 120 → 150 → 180 → 210 → 240 → 270 → 300 → 330 с\n    """
     global _last_draft_time
     MAX_ATTEMPTS = 10
     BASE_WAIT    = 65   # секунд — минимальный интервал между запросами
@@ -316,8 +310,7 @@ async def load_all_orders() -> dict:
 
 # ===== ПЕРЕНОС БЛИЖАЙШИХ ЗАЯВОК =====
 async def reschedule_near_orders() -> str:
-    """Переносит заявки DATA_FILLING с датой поставки в ближайшие 5 дней
-    на случайную дату от +15 до +27 дней от сегодня, слот 19:00-20:00 МСК (16:00-17:00 UTC)."""
+    """Переносит заявки DATA_FILLING с датой поставки в ближайшие 5 дней\n    на случайную дату от +15 до +27 дней от сегодня, слот 19:00-20:00 МСК (16:00-17:00 UTC)."""
     today    = datetime.now(MOSCOW_TZ).date()
     date_to  = today + timedelta(days=5)
     results, errors = [], []
@@ -531,16 +524,17 @@ async def reschedule_near_orders(grouped: dict) -> str:
 async def fetch_all_ozon_clusters(session: aiohttp.ClientSession) -> list[dict]:
     data = await ozon_post(session, f"{OZON_API_URL}/v1/cluster/list",
                            {"cluster_type": "CLUSTER_TYPE_OZON"})
-    return data.get("clusters", [])
+    clusters = data.get("clusters", [])
+    # Логируем Воронеж для диагностики
+    for c in clusters:
+        if "воронеж" in c.get("name", "").lower():
+            logging.info(f"ВОРОНЕЖ cluster raw: {json.dumps(c, ensure_ascii=False)[:600]}")
+    return clusters
 
 
 # ===== СУПЕРПОСТАВКИ: найти точку отгрузки СТАВРОПОЛЬ_АППЗ_2 (DROPOFF) =====
 async def find_drop_off_warehouse_id(session: aiohttp.ClientSession) -> int:
-    """
-    Ищет точку отгрузки СТАВРОПОЛЬ_АППЗ_2 через /v1/cluster/list.
-    Для типа поставки CROSSDOCK — товар сдаётся в пункт приёма Ozon.
-    Возвращает warehouse_id точки.
-    """
+    """\n    Ищет точку отгрузки СТАВРОПОЛЬ_АППЗ_2 через /v1/cluster/list.\n    Для типа поставки CROSSDOCK — товар сдаётся в пункт приёма Ozon.\n    Возвращает warehouse_id точки.\n    """
     try:
         data = await ozon_post(session, f"{OZON_API_URL}/v1/cluster/list",
                                {"cluster_type": "CLUSTER_TYPE_OZON"})
@@ -555,6 +549,67 @@ async def find_drop_off_warehouse_id(session: aiohttp.ClientSession) -> int:
         raise Exception(f"Точка '{STAVROPOL_WAREHOUSE_NAME}' не найдена в cluster/list")
     except Exception as e:
         raise Exception(f"Ошибка поиска точки отгрузки: {e}")
+
+
+# ===== ДИАГНОСТИКА: доступные кластеры для точки отгрузки =====
+async def run_diagnose_clusters() -> str:
+    """\n    Создаёт тестовый черновик для каждого кластера и показывает,\n    для каких кластеров СТАВРОПОЛЬ_АППЗ_2 доступна.\n    """
+    lines = ["🔍 Диагностика: доступные кластеры для СТАВРОПОЛЬ_АППЗ_2\n"]
+
+    async with aiohttp.ClientSession() as session:
+        try:
+            drop_off_wh_id = await find_drop_off_warehouse_id(session)
+            lines.append(f"📦 Точка отгрузки id={drop_off_wh_id}\n")
+        except Exception as e:
+            return f"❌ {e}"
+
+        super_skus = await fetch_super_skus(session)
+        if not super_skus:
+            return "❌ Super-товары не найдены"
+        sku = super_skus[0]["sku"]
+
+        clusters = await fetch_all_ozon_clusters(session)
+        lines.append(f"Всего кластеров: {len(clusters)}\n")
+
+        ok, fail = [], []
+        for c in clusters:
+            cid  = str(c.get("id") or c.get("macrolocal_cluster_id", ""))
+            name = c.get("name", cid)
+            try:
+                payload = {
+                    "cluster_info": {
+                        "items": [{"sku": sku, "quantity": 1}],
+                        "macrolocal_cluster_id": int(cid),
+                    },
+                    "deletion_sku_mode": "PARTIAL",
+                    "delivery_info": {
+                        "type": "DROPOFF",
+                        "drop_off_warehouse": {
+                            "warehouse_id":   drop_off_wh_id,
+                            "warehouse_type": "ORDERS_RECEIVING_POINT",
+                        },
+                    },
+                }
+                resp = await ozon_post_draft(session,
+                    f"{OZON_API_URL}/v1/draft/crossdock/create", payload)
+                did  = resp.get("draft_id", 0)
+                errs = resp.get("errors", [])
+                reasons = [e.get("error_message", "") for e in errs]
+                if did and did != 0 and not any(r in ("CAN_NOT_CREATE_DRAFT",) for r in reasons):
+                    ok.append(f"✅ {name} (id={cid}, draft={did})")
+                else:
+                    r = ", ".join(reasons) if reasons else "—"
+                    fail.append(f"❌ {name} (id={cid}): {r}")
+            except Exception as e:
+                fail.append(f"❌ {name} (id={cid}): {str(e)[:80]}")
+
+    if ok:
+        lines.append("✅ Доступные кластеры:")
+        lines.extend(ok)
+    if fail:
+        lines.append("\n❌ Недоступные:")
+        lines.extend(fail)
+    return "\n".join(lines)
 
 
 # ===== СУПЕРПОСТАВКИ: получить Super-товары =====
@@ -623,11 +678,7 @@ async def find_best_timeslot(session: aiohttp.ClientSession,
                               supply_type: str = "DIRECT",
                               day_min: int = 14,
                               day_max: int = 19) -> tuple[str, str]:
-    """
-    Использует /v2/draft/timeslot/info.
-    Принимает draft_id из /v2/draft/create/info (не из v1!).
-    Возвращает (from_in_timezone, to_in_timezone) — строки в формате склада.
-    """
+    """\n    Использует /v2/draft/timeslot/info.\n    Принимает draft_id из /v2/draft/create/info (не из v1!).\n    Возвращает (from_in_timezone, to_in_timezone) — строки в формате склада.\n    """
     today     = datetime.now(MOSCOW_TZ).date()
     date_from = today + timedelta(days=day_min)
     date_to   = today + timedelta(days=day_max)
@@ -689,16 +740,7 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
                                      drop_off_warehouse_id: int,
                                      sku: int,
                                      sku_name: str) -> dict:
-    """
-    Создаёт одну заявку (1 SKU, 5 шт) для указанного кластера.
-    Тип поставки: CROSSDOCK — товар сдаётся в точку СТАВРОПОЛЬ_АППЗ_2.
-    Использует v2 API:
-      /v1/draft/crossdock/create → draft_id
-      /v2/draft/create/info      → polling + storage_warehouse_id
-      /v2/draft/timeslot/info    → таймслоты
-      /v2/draft/supply/create    → создание заявки
-      /v2/draft/supply/create/status → polling по draft_id
-    """
+    """\n    Создаёт одну заявку (1 SKU, 5 шт) для указанного кластера.\n    Тип поставки: CROSSDOCK — товар сдаётся в точку СТАВРОПОЛЬ_АППЗ_2.\n    Использует v2 API:\n      /v1/draft/crossdock/create → draft_id\n      /v2/draft/create/info      → polling + storage_warehouse_id\n      /v2/draft/timeslot/info    → таймслоты\n      /v2/draft/supply/create    → создание заявки\n      /v2/draft/supply/create/status → polling по draft_id\n    """
     result = {
         "cluster":   cluster_name_str,
         "sku":       sku,
@@ -851,10 +893,7 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
 
 # ===== СУПЕРПОСТАВКИ: ТЕСТ — одна заявка в Воронеж =====
 async def run_super_supply_test() -> str:
-    """
-    Тестовый режим: создаёт одну заявку в кластер Воронеж
-    для первого найденного Super-товара.
-    """
+    """\n    Тестовый режим: создаёт одну заявку в кластер Воронеж\n    для первого найденного Super-товара.\n    """
     lines = ["🧪 ТЕСТ: Создание заявки в кластер Воронеж\n"]
 
     async with aiohttp.ClientSession() as session:
@@ -921,10 +960,7 @@ async def run_super_supply_test() -> str:
 
 # ===== СУПЕРПОСТАВКИ: ПОЛНЫЙ ЗАПУСК — все кластеры =====
 async def run_super_supply_all() -> str:
-    """
-    Создаёт заявки во все кластеры OZON кроме исключённых.
-    Для каждого кластера: 1 артикул (первый Super-товар), 5 шт.
-    """
+    """\n    Создаёт заявки во все кластеры OZON кроме исключённых.\n    Для каждого кластера: 1 артикул (первый Super-товар), 5 шт.\n    """
     lines = ["🚀 Суперпоставки: создание заявок во все кластеры\n"]
 
     async with aiohttp.ClientSession() as session:
@@ -1371,6 +1407,7 @@ async def handle_create_orders_menu(call: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⚡ Суперпоставки (тест — Воронеж)", callback_data="super_supply_test")],
         [InlineKeyboardButton(text="🚀 Суперпоставки (все кластеры)",   callback_data="super_supply_confirm")],
+        [InlineKeyboardButton(text="🔍 Диагностика кластеров",          callback_data="diagnose_clusters")],
         [InlineKeyboardButton(text="◀️ Главное меню",                   callback_data="main_menu")],
     ])
     await call.message.edit_text(
@@ -1422,6 +1459,32 @@ async def handle_super_supply_confirm(call: CallbackQuery):
         "Продолжить?",
         reply_markup=kb
     )
+
+
+# ===== ДИАГНОСТИКА КЛАСТЕРОВ =====
+@dp.callback_query(F.data == "diagnose_clusters")
+async def handle_diagnose_clusters(call: CallbackQuery):
+    await call.answer()
+    await call.message.edit_text(
+        "🔍 Проверяю доступные кластеры для СТАВРОПОЛЬ_АППЗ_2...\n"
+        "Это займёт несколько минут (1 запрос в минуту)."
+    )
+    try:
+        result = await run_diagnose_clusters()
+    except Exception as e:
+        logging.exception("diagnose_clusters error")
+        result = f"❌ Ошибка: {e}"
+
+    back_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ Назад", callback_data="create_orders_menu")],
+        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
+    ])
+    chunks = [result[i:i + 4000] for i in range(0, len(result), 4000)]
+    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
+    for i, chunk in enumerate(chunks[1:], 1):
+        await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
+    if len(chunks) > 1:
+        await call.message.answer("⬆️ Результат выше", reply_markup=back_kb)
 
 
 # ===== СУПЕРПОСТАВКИ: ЗАПУСК =====
