@@ -77,22 +77,27 @@ async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, ret
     raise Exception(f"Превышен лимит запросов к {url}")
 
 
-# ===== POST специально для draft/create (агрессивный backoff) =====
+# ===== POST специально для draft/create (1 раз в минуту лимит) =====
 async def ozon_post_draft(session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
-    """POST с экспоненциальным backoff для эндпоинтов с жёстким rate limit."""
-    waits = [5, 10, 20, 30, 60, 60, 60]
+    """
+    /v1/draft/create имеет лимит 1 запрос в минуту.
+    Ждём 65 секунд между попытками.
+    """
+    waits = [0, 65, 65, 65, 65]  # первая попытка сразу, затем по 65 сек
     for attempt, wait in enumerate(waits):
-        await asyncio.sleep(wait)  # всегда ждём перед запросом
+        if wait > 0:
+            logging.info(f"draft/create: жду {wait}с перед попыткой {attempt+1}...")
+            await asyncio.sleep(wait)
         async with session.post(url, headers=ozon_headers(), json=payload) as resp:
             raw = await resp.text()
             logging.info(f"POST {url} → {resp.status} | {raw[:200]}")
             if resp.status == 429:
-                logging.warning(f"draft 429, жду {waits[min(attempt+1, len(waits)-1)]}с (attempt {attempt+1})")
+                logging.warning(f"draft 429 (attempt {attempt+1}), жду 65с...")
                 continue
             if resp.status != 200:
                 raise Exception(f"HTTP {resp.status} [{url}]: {raw[:200]}")
             return json.loads(raw)
-    raise Exception(f"Превышен лимит запросов к {url}")
+    raise Exception(f"Превышен лимит запросов к {url} после {len(waits)} попыток")
 
 
 # ===== POLLING =====
