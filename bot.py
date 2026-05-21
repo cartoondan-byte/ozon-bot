@@ -3,6 +3,7 @@ import random
 import logging
 import json
 import os
+import time
 from datetime import datetime, timedelta
 import pytz
 import aiohttp
@@ -39,6 +40,10 @@ SUPER_PRODUCT_TAG = "super"   # фильтр по названию/тегу Supe
 # ===== АДАПТИВНЫЙ RATE LIMITER =====
 _bundle_semaphore = asyncio.Semaphore(3)
 _bundle_delay     = 0.15
+
+# ===== ГЛОБАЛЬНЫЙ СЕМАФОР ДЛЯ draft/create (1 запрос в минуту) =====
+_draft_semaphore  = asyncio.Semaphore(1)
+_last_draft_time  = 0.0   # время последнего успешного draft/create (time.monotonic)
 _bundle_delay_min = 0.05
 _bundle_delay_max = 2.0
 
@@ -80,24 +85,40 @@ async def ozon_post(session: aiohttp.ClientSession, url: str, payload: dict, ret
 # ===== POST специально для draft/create (1 раз в минуту лимит) =====
 async def ozon_post_draft(session: aiohttp.ClientSession, url: str, payload: dict) -> dict:
     """
-    /v1/draft/create имеет лимит 1 запрос в минуту.
-    Ждём 65 секунд между попытками.
+    /v1/draft/create имеет лимит 1 запрос в минуту на весь аккаунт.
+    Используем глобальный семафор (_draft_semaphore=1), чтобы никогда не
+    отправлять два запроса параллельно, плюс гарантируем паузу ≥65 с
+    после предыдущего успешного вызова.
+    Экспоненциальный backoff при 429: 65 → 90 → 120 → 150 → 180 → 210 → 240 → 270 → 300 → 330 с
     """
-    waits = [0, 65, 65, 65, 65]  # первая попытка сразу, затем по 65 сек
-    for attempt, wait in enumerate(waits):
-        if wait > 0:
-            logging.info(f"draft/create: жду {wait}с перед попыткой {attempt+1}...")
-            await asyncio.sleep(wait)
-        async with session.post(url, headers=ozon_headers(), json=payload) as resp:
-            raw = await resp.text()
-            logging.info(f"POST {url} → {resp.status} | {raw[:200]}")
-            if resp.status == 429:
-                logging.warning(f"draft 429 (attempt {attempt+1}), жду 65с...")
-                continue
-            if resp.status != 200:
-                raise Exception(f"HTTP {resp.status} [{url}]: {raw[:200]}")
-            return json.loads(raw)
-    raise Exception(f"Превышен лимит запросов к {url} после {len(waits)} попыток")
+    global _last_draft_time
+    MAX_ATTEMPTS = 10
+    BASE_WAIT    = 65   # секунд — минимальный интервал между запросами
+
+    async with _draft_semaphore:
+        for attempt in range(MAX_ATTEMPTS):
+            # Гарантируем паузу ≥ BASE_WAIT с момента последнего вызова
+            elapsed = time.monotonic() - _last_draft_time
+            if elapsed < BASE_WAIT:
+                pause = BASE_WAIT - elapsed + 1
+                logging.info(f"draft/create: жду {pause:.0f}с до следующей попытки (attempt {attempt+1})...")
+                await asyncio.sleep(pause)
+
+            async with session.post(url, headers=ozon_headers(), json=payload) as resp:
+                raw = await resp.text()
+                logging.info(f"POST {url} → {resp.status} | {raw[:200]}")
+                if resp.status == 429:
+                    extra_wait = BASE_WAIT + attempt * 30  # 65, 95, 125, 155 …
+                    logging.warning(f"draft 429 (attempt {attempt+1}/{MAX_ATTEMPTS}), жду {extra_wait}с...")
+                    _last_draft_time = time.monotonic()    # сбрасываем таймер
+                    await asyncio.sleep(extra_wait)
+                    continue
+                if resp.status != 200:
+                    raise Exception(f"HTTP {resp.status} [{url}]: {raw[:200]}")
+                _last_draft_time = time.monotonic()
+                return json.loads(raw)
+
+        raise Exception(f"Превышен лимит запросов к {url} после {MAX_ATTEMPTS} попыток")
 
 
 # ===== POLLING =====
@@ -513,15 +534,24 @@ async def fetch_all_ozon_clusters(session: aiohttp.ClientSession) -> list[dict]:
     return data.get("clusters", [])
 
 
-# ===== СУПЕРПОСТАВКИ: найти точку отгрузки =====
-async def find_drop_off_warehouse(session: aiohttp.ClientSession) -> tuple[int, str]:
+# ===== СУПЕРПОСТАВКИ: найти склад продавца (PICKUP = курьер Ozon) =====
+async def find_seller_warehouse_id(session: aiohttp.ClientSession) -> int:
     """
-    Тип поставки DIRECT — Ozon сам забирает товар со склада продавца.
-    drop_off_point_warehouse_id не нужен для DIRECT.
-    Возвращаем (0, "CREATE_TYPE_DIRECT").
+    Возвращает первый активный seller_warehouse_id из /v1/warehouse/fbo/seller/list.
+    Используется для типа поставки DIRECT (курьер Ozon забирает со склада продавца).
     """
-    logging.info("Тип поставки: CREATE_TYPE_DIRECT (Доставит Ozon)")
-    return 0, "CREATE_TYPE_DIRECT"
+    try:
+        data = await ozon_post(session, f"{OZON_API_URL}/v1/warehouse/fbo/seller/list", {})
+        warehouses = data.get("warehouses", [])
+        for wh in warehouses:
+            wh_id = wh.get("warehouse_id") or wh.get("id")
+            if wh_id:
+                name = wh.get("name", "")
+                logging.info(f"Склад продавца найден: id={wh_id} name={name}")
+                return int(wh_id)
+        raise Exception(f"Нет складов продавца в ответе: {data}")
+    except Exception as e:
+        raise Exception(f"Ошибка получения склада продавца: {e}")
 
 
 # ===== СУПЕРПОСТАВКИ: получить Super-товары =====
@@ -582,42 +612,60 @@ async def fetch_super_skus(session: aiohttp.ClientSession) -> list[dict]:
     return skus
 
 
-# ===== СУПЕРПОСТАВКИ: найти таймслот =====
+# ===== СУПЕРПОСТАВКИ: найти таймслот (v2 API) =====
 async def find_best_timeslot(session: aiohttp.ClientSession,
                               draft_id: int,
-                              drop_off_wh_id: int,
+                              cluster_id: str,
+                              storage_warehouse_id: int,
+                              supply_type: str = "DIRECT",
                               day_min: int = 14,
                               day_max: int = 19) -> tuple[str, str]:
+    """
+    Использует /v2/draft/timeslot/info.
+    Принимает draft_id из /v2/draft/create/info (не из v1!).
+    Возвращает (from_in_timezone, to_in_timezone) — строки в формате склада.
+    """
     today     = datetime.now(MOSCOW_TZ).date()
     date_from = today + timedelta(days=day_min)
     date_to   = today + timedelta(days=day_max)
 
-    data = await ozon_post(
-        session,
-        f"{OZON_API_URL}/v1/draft/timeslot/info",
-        {
-            "draft_id":  draft_id,
-            "date_from": date_from.strftime("%Y-%m-%dT00:00:00Z"),
-            "date_to":   date_to.strftime("%Y-%m-%dT23:59:59Z"),
-        }
-    )
+    payload = {
+        "draft_id":    draft_id,
+        "date_from":   date_from.strftime("%Y-%m-%d"),
+        "date_to":     date_to.strftime("%Y-%m-%d"),
+        "supply_type": supply_type,
+        "selected_cluster_warehouses": [
+            {
+                "macrolocal_cluster_id": int(cluster_id),
+                "storage_warehouse_id":  storage_warehouse_id,
+            }
+        ],
+    }
+    logging.info(f"timeslot/info payload: {json.dumps(payload, ensure_ascii=False)}")
+    data = await ozon_post(session, f"{OZON_API_URL}/v2/draft/timeslot/info", payload)
 
-    # Собираем все доступные слоты
+    error_reason = data.get("error_reason", "UNSPECIFIED")
+    if error_reason not in ("UNSPECIFIED", ""):
+        raise Exception(f"timeslot/info ошибка: {error_reason}")
+
+    # Структура v2: result.drop_off_warehouse_timeslots.days[]
+    result_obj = data.get("result", {})
+    ts_obj     = result_obj.get("drop_off_warehouse_timeslots", {})
+    days       = ts_obj.get("days", [])
+
     all_slots = []
-    for wh in data.get("drop_off_warehouse_timeslots", []):
-        for day in wh.get("days", []):
-            date_str = day.get("date_in_timezone", "")[:10]
-            for ts in day.get("timeslots", []):
-                all_slots.append((date_str, ts.get("from_in_timezone", ""), ts.get("to_in_timezone", "")))
+    for day in days:
+        date_str = day.get("date_in_timezone", "")[:10]
+        for ts in day.get("timeslots", []):
+            all_slots.append((date_str, ts.get("from_in_timezone", ""), ts.get("to_in_timezone", "")))
 
     if not all_slots:
-        raise Exception("Нет доступных слотов в диапазоне дат!")
+        raise Exception("Нет доступных таймслотов в диапазоне дат!")
 
-    # Случайный порядок дат
-    available_dates = list(set(d for d, _, _ in all_slots))
+    # Предпочтительные часы, случайный порядок дат
+    available_dates = sorted(set(d for d, _, _ in all_slots))
     random.shuffle(available_dates)
-
-    preferred_hours = ["19:00", "18:00"]
+    preferred_hours = ["19:00", "18:00", "17:00", "20:00"]
 
     for target_date in available_dates:
         slots = [(f, t) for d, f, t in all_slots if d == target_date]
@@ -625,145 +673,170 @@ async def find_best_timeslot(session: aiohttp.ClientSession,
             for ts_from, ts_to in slots:
                 if hour in ts_from:
                     return ts_from, ts_to
-        # Любой слот в этот день
         if slots:
             return slots[0]
 
     raise Exception("Не удалось подобрать слот!")
 
 
-# ===== СУПЕРПОСТАВКИ: создать одну заявку для кластера =====
+# ===== СУПЕРПОСТАВКИ: создать одну заявку для кластера (v2 API) =====
 async def create_supply_for_cluster(session: aiohttp.ClientSession,
                                      cluster_id: str,
                                      cluster_name_str: str,
-                                     drop_off_wh_id: int,
-                                     supply_type: str,
+                                     seller_warehouse_id: int,
                                      sku: int,
                                      sku_name: str) -> dict:
     """
     Создаёт одну заявку (1 SKU, 5 шт) для указанного кластера.
-    Возвращает словарь с результатом.
+    Использует новое v2 API:
+      /v1/draft/direct/create  → draft_id
+      /v2/draft/create/info    → polling + storage_warehouse_id
+      /v2/draft/timeslot/info  → таймслоты
+      /v2/draft/supply/create  → создание заявки (возвращает draft_id, не operation_id)
+      /v2/draft/supply/create/status → polling по draft_id
     """
     result = {
-        "cluster":  cluster_name_str,
-        "sku":      sku,
-        "sku_name": sku_name,
-        "qty":      5,
-        "success":  False,
-        "order_ids": [],
-        "timeslot": "",
-        "error":    "",
+        "cluster":   cluster_name_str,
+        "sku":       sku,
+        "sku_name":  sku_name,
+        "qty":       5,
+        "success":   False,
+        "order_id":  None,
+        "timeslot":  "",
+        "error":     "",
     }
 
     try:
-        # 1. Создать черновик
-        payload = {
-            "cluster_ids": [str(cluster_id)],
-            "items":       [{"sku": sku, "quantity": 5}],
-            "type":        supply_type,
+        # ── 1. Создать черновик DIRECT ──────────────────────────────────────
+        draft_payload = {
+            "cluster_info": {
+                "items": [{"sku": sku, "quantity": 5}],
+                "macrolocal_cluster_id": int(cluster_id),
+            },
+            "delivery_info": {
+                "type":               "PICKUP",
+                "seller_warehouse_id": seller_warehouse_id,
+            },
         }
-        # DROP_OFF не нужен для CREATE_TYPE_DIRECT
+        logging.info(f"direct/create payload: {json.dumps(draft_payload, ensure_ascii=False)}")
+        draft_resp = await ozon_post_draft(
+            session, f"{OZON_API_URL}/v1/draft/direct/create", draft_payload
+        )
+        draft_id = draft_resp.get("draft_id")
+        if not draft_id:
+            errs = draft_resp.get("errors", [])
+            raise Exception(f"direct/create не вернул draft_id: {draft_resp} | errors: {errs}")
+        logging.info(f"draft_id={draft_id} для кластера {cluster_name_str}")
 
-        logging.info(f"draft/create payload: {json.dumps(payload, ensure_ascii=False)}")
-        resp = await ozon_post_draft(session, f"{OZON_API_URL}/v1/draft/create", payload)
-        operation_id = resp.get("operation_id")
-        if not operation_id:
-            raise Exception(f"draft/create не вернул operation_id: {resp}")
-
-        # 2. Polling черновика
+        # ── 2. Polling /v2/draft/create/info ───────────────────────────────
         info = await poll(
             session,
-            f"{OZON_API_URL}/v1/draft/create/info",
-            {"operation_id": operation_id},
-            success_statuses=["CALCULATION_STATUS_SUCCESS"],
-            fail_statuses=["CALCULATION_STATUS_FAILED", "CALCULATION_STATUS_EXPIRED"],
+            f"{OZON_API_URL}/v2/draft/create/info",
+            {"draft_id": draft_id},
+            success_statuses=["SUCCESS"],
+            fail_statuses=["FAILED"],
+            status_field="status",
             interval=3.0,
-            max_attempts=20
+            max_attempts=20,
         )
-
-        draft_id = info.get("draft_id")
-        if not draft_id:
-            raise Exception(f"draft/create/info не вернул draft_id: {info}")
+        logging.info(f"draft/create/info: {json.dumps(info, ensure_ascii=False)[:400]}")
 
         draft_errors = info.get("errors", [])
         if draft_errors:
-            logging.warning(f"draft errors для {cluster_name_str}: {draft_errors}")
+            msgs = [e.get("error_message", "") for e in draft_errors]
+            if any(m not in ("UNSPECIFIED", "") for m in msgs):
+                raise Exception(f"Ошибки черновика: {msgs}")
 
-        # 3. Найти склад размещения
-        placement_wh_id = None
+        # ── 3. Найти storage_warehouse_id ─────────────────────────────────
+        # В v2 структура: clusters[].warehouses[].storage_warehouse.warehouse_id
+        storage_wh_id = None
         for cl in info.get("clusters", []):
             for wh in cl.get("warehouses", []):
-                if wh.get("status", {}).get("is_available"):
-                    placement_wh_id = wh.get("supply_warehouse", {}).get("warehouse_id")
-                    break
-            if placement_wh_id:
+                avail = wh.get("availability_status", {})
+                # Берём доступный склад; если нет — берём первый как fallback
+                wh_id = wh.get("storage_warehouse", {}).get("warehouse_id")
+                if wh_id:
+                    if avail.get("state", "") in ("", "UNSPECIFIED") or storage_wh_id is None:
+                        storage_wh_id = wh_id
+                    if avail.get("state", "") == "AVAILABLE":
+                        storage_wh_id = wh_id
+                        break
+            if storage_wh_id:
                 break
-        if not placement_wh_id:
-            # fallback: берём первый
-            for cl in info.get("clusters", []):
-                for wh in cl.get("warehouses", []):
-                    placement_wh_id = wh.get("supply_warehouse", {}).get("warehouse_id")
-                    break
-                if placement_wh_id:
-                    break
-        if not placement_wh_id:
-            raise Exception("Не найден склад размещения!")
 
-        # 4. Найти слот
-        ts_from, ts_to = await find_best_timeslot(session, draft_id, drop_off_wh_id)
+        if not storage_wh_id:
+            raise Exception(f"Не найден storage_warehouse_id в info: {json.dumps(info)[:300]}")
+        logging.info(f"storage_warehouse_id={storage_wh_id}")
 
-        # 5. Создать заявку
-        create_resp = await ozon_post(
+        # ── 4. Получить таймслот (/v2/draft/timeslot/info) ─────────────────
+        ts_from, ts_to = await find_best_timeslot(
             session,
-            f"{OZON_API_URL}/v1/draft/supply/create",
-            {
-                "draft_id":     draft_id,
-                "warehouse_id": placement_wh_id,
-                "timeslot": {
-                    "from_in_timezone": ts_from,
-                    "to_in_timezone":   ts_to,
-                }
-            }
+            draft_id=draft_id,
+            cluster_id=cluster_id,
+            storage_warehouse_id=storage_wh_id,
+            supply_type="DIRECT",
         )
-        op_id = create_resp.get("operation_id")
-        if not op_id:
-            raise Exception(f"draft/supply/create не вернул operation_id: {create_resp}")
+        logging.info(f"Выбран слот: {ts_from} – {ts_to}")
 
-        # 6. Polling статуса создания
+        # ── 5. Создать заявку (/v2/draft/supply/create) ────────────────────
+        supply_payload = {
+            "draft_id": draft_id,
+            "selected_cluster_warehouses": [
+                {
+                    "macrolocal_cluster_id": int(cluster_id),
+                    "storage_warehouse_id":  storage_wh_id,
+                }
+            ],
+            "timeslot": {
+                "from_in_timezone": ts_from,
+                "to_in_timezone":   ts_to,
+            },
+            "supply_type": "DIRECT",
+        }
+        logging.info(f"supply/create payload: {json.dumps(supply_payload, ensure_ascii=False)}")
+        supply_resp = await ozon_post(
+            session, f"{OZON_API_URL}/v2/draft/supply/create", supply_payload
+        )
+        logging.info(f"supply/create response: {supply_resp}")
+
+        supply_errs = supply_resp.get("error_reasons", [])
+        if supply_errs and any(e not in ("UNSPECIFIED", "") for e in supply_errs):
+            raise Exception(f"supply/create ошибки: {supply_errs}")
+
+        # v2 возвращает draft_id, не operation_id — поллим по нему
+        resp_draft_id = supply_resp.get("draft_id") or draft_id
+
+        # ── 6. Polling /v2/draft/supply/create/status ──────────────────────
         status_data = await poll(
             session,
-            f"{OZON_API_URL}/v1/draft/supply/create/status",
-            {"operation_id": op_id},
-            success_statuses=["DraftSupplyCreateStatusSuccess"],
-            fail_statuses=["DraftSupplyCreateStatusFailed"],
+            f"{OZON_API_URL}/v2/draft/supply/create/status",
+            {"draft_id": resp_draft_id},
+            success_statuses=["SUCCESS"],
+            fail_statuses=["FAILED"],
+            status_field="status",
             interval=3.0,
-            max_attempts=20
+            max_attempts=20,
         )
+        logging.info(f"supply/create/status: {status_data}")
 
-        order_ids = status_data.get("result", {}).get("order_ids", [])
-        errs      = status_data.get("error_messages", [])
-        if errs:
-            raise Exception(f"Ошибки создания: {errs}")
-        if not order_ids:
-            raise Exception(f"Заявки не созданы: {status_data}")
+        status_errs = status_data.get("error_reasons", [])
+        if status_errs and any(e not in ("UNSPECIFIED", "") for e in status_errs):
+            raise Exception(f"Ошибки создания заявки: {status_errs}")
 
-        # Форматируем слот в МСК для отображения
-        try:
-            dt_from = datetime.strptime(ts_from[:19], "%Y-%m-%dT%H:%M:%S")
-            dt_from = pytz.utc.localize(dt_from).astimezone(MOSCOW_TZ)
-            dt_to   = datetime.strptime(ts_to[:19], "%Y-%m-%dT%H:%M:%S")
-            dt_to   = pytz.utc.localize(dt_to).astimezone(MOSCOW_TZ)
-            ts_str  = f"{dt_from.strftime('%d.%m.%Y %H:%M')}–{dt_to.strftime('%H:%M')} МСК"
-        except Exception:
-            ts_str = f"{ts_from} – {ts_to}"
+        order_id = status_data.get("order_id")
+        if not order_id:
+            raise Exception(f"order_id не получен: {status_data}")
 
-        result["success"]   = True
-        result["order_ids"] = order_ids
-        result["timeslot"]  = ts_str
+        # Форматируем слот для отображения (строки уже в часовом поясе склада)
+        ts_str = f"{ts_from[:16]} – {ts_to[:16]}"
+
+        result["success"]  = True
+        result["order_id"] = order_id
+        result["timeslot"] = ts_str
 
     except Exception as e:
         logging.exception(f"create_supply_for_cluster {cluster_name_str}: {e}")
-        result["error"] = str(e)[:200]
+        result["error"] = str(e)[:300]
 
     return result
 
@@ -777,12 +850,12 @@ async def run_super_supply_test() -> str:
     lines = ["🧪 ТЕСТ: Создание заявки в кластер Воронеж\n"]
 
     async with aiohttp.ClientSession() as session:
-        # Найти точку отгрузки
+        # Найти склад продавца
         try:
-            drop_off_wh_id, supply_type = await find_drop_off_warehouse(session)
-            lines.append(f"📦 Точка отгрузки: {STAVROPOL_WAREHOUSE_NAME} (id={drop_off_wh_id}, тип={supply_type})")
+            seller_wh_id = await find_seller_warehouse_id(session)
+            lines.append(f"📦 Склад продавца: id={seller_wh_id} (тип поставки: DIRECT)")
         except Exception as e:
-            return f"❌ Не найдена точка отгрузки: {e}"
+            return f"❌ Не найден склад продавца: {e}"
 
         # Найти Super-товары
         lines.append("🔍 Ищу Super-товары...")
@@ -807,7 +880,7 @@ async def run_super_supply_test() -> str:
         if not voronezh:
             return "\n".join(lines) + "\n❌ Кластер Воронеж не найден!"
 
-        cluster_id  = str(voronezh.get("id"))
+        cluster_id  = str(voronezh.get("id") or voronezh.get("macrolocal_cluster_id", ""))
         cluster_nm  = voronezh.get("name", "Воронеж")
         lines.append(f"🏭 Кластер: {cluster_nm} (id={cluster_id})\n")
         lines.append("⏳ Создаю заявку...")
@@ -817,8 +890,7 @@ async def run_super_supply_test() -> str:
             session,
             cluster_id=cluster_id,
             cluster_name_str=cluster_nm,
-            drop_off_wh_id=drop_off_wh_id,
-            supply_type=supply_type,
+            seller_warehouse_id=seller_wh_id,
             sku=sku,
             sku_name=sku_name
         )
@@ -830,8 +902,8 @@ async def run_super_supply_test() -> str:
         lines.append(f"   SKU:      {res['sku']}")
         lines.append(f"   Товар:    {res['sku_name'][:60]}")
         lines.append(f"   Кол-во:   {res['qty']} шт")
-        lines.append(f"   Дата:     {res['timeslot']}")
-        lines.append(f"   Order ID: {', '.join(str(x) for x in res['order_ids'])}")
+        lines.append(f"   Слот:     {res['timeslot']}")
+        lines.append(f"   Order ID: {res['order_id']}")
     else:
         lines.append(f"❌ Заявка НЕ создана в кластер {res['cluster']}")
         lines.append(f"   Ошибка: {res['error']}")
@@ -848,12 +920,12 @@ async def run_super_supply_all() -> str:
     lines = ["🚀 Суперпоставки: создание заявок во все кластеры\n"]
 
     async with aiohttp.ClientSession() as session:
-        # Найти точку отгрузки
+        # Найти склад продавца
         try:
-            drop_off_wh_id, supply_type = await find_drop_off_warehouse(session)
-            lines.append(f"📦 Точка отгрузки: {STAVROPOL_WAREHOUSE_NAME} (id={drop_off_wh_id})")
+            seller_wh_id = await find_seller_warehouse_id(session)
+            lines.append(f"📦 Склад продавца: id={seller_wh_id} (тип: DIRECT)")
         except Exception as e:
-            return f"❌ Не найдена точка отгрузки: {e}"
+            return f"❌ Не найден склад продавца: {e}"
 
         # Найти Super-товары
         super_skus = await fetch_super_skus(session)
@@ -887,15 +959,14 @@ async def run_super_supply_all() -> str:
         errors   = []
 
         for c in active_clusters:
-            cluster_id = str(c.get("id"))
+            cluster_id = str(c.get("id") or c.get("macrolocal_cluster_id", ""))
             cluster_nm = c.get("name", cluster_id)
 
             res = await create_supply_for_cluster(
                 session,
                 cluster_id=cluster_id,
                 cluster_name_str=cluster_nm,
-                drop_off_wh_id=drop_off_wh_id,
-                supply_type=supply_type,
+                seller_warehouse_id=seller_wh_id,
                 sku=sku,
                 sku_name=sku_name
             )
@@ -905,7 +976,7 @@ async def run_super_supply_all() -> str:
                     f"✅ {cluster_nm}\n"
                     f"   SKU: {res['sku']} | {res['sku_name'][:40]}\n"
                     f"   Кол-во: {res['qty']} шт | {res['timeslot']}\n"
-                    f"   Order ID: {', '.join(str(x) for x in res['order_ids'])}"
+                    f"   Order ID: {res['order_id']}"
                 )
             else:
                 errors.append(
