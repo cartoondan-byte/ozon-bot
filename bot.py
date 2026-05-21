@@ -910,7 +910,7 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
 # ===== СУПЕРПОСТАВКИ: ТЕСТ — одна заявка в Воронеж =====
 async def run_super_supply_test() -> str:
     """\n    Тестовый режим: создаёт одну заявку в кластер Воронеж\n    для первого найденного Super-товара.\n    """
-    lines = ["🧪 ТЕСТ: Создание заявки в кластер Воронеж\n"]
+    lines = ["🧪 ТЕСТ: Создание заявки в кластер Москва, МО и Дальние регионы\n"]
 
     async with aiohttp.ClientSession() as session:
         # Найти точку отгрузки СТАВРОПОЛЬ_АППЗ_2
@@ -933,18 +933,19 @@ async def run_super_supply_test() -> str:
         sku_name  = test_item["name"]
         lines.append(f"🏷 Тестовый SKU: {sku} | {sku_name[:50]}")
 
-        # Найти кластер Воронеж
+        # Найти кластер Москва, МО и Дальние регионы
         clusters = await fetch_all_ozon_clusters(session)
-        voronezh = None
+        target = None
         for c in clusters:
-            if "воронеж" in c.get("name", "").lower():
-                voronezh = c
+            if "москва" in c.get("name", "").lower() and "дальн" in c.get("name", "").lower():
+                target = c
                 break
-        if not voronezh:
-            return "\n".join(lines) + "\n❌ Кластер Воронеж не найден!"
+        if not target:
+            names = [c.get("name") for c in clusters]
+            return "\n".join(lines) + f"\n❌ Кластер не найден! Доступные: {names}"
 
-        cluster_id  = str(voronezh.get("id") or voronezh.get("macrolocal_cluster_id", ""))
-        cluster_nm  = voronezh.get("name", "Воронеж")
+        cluster_id  = str(target.get("macrolocal_cluster_id") or target.get("id", ""))
+        cluster_nm  = target.get("name", "Москва, МО и Дальние регионы")
         lines.append(f"🏭 Кластер: {cluster_nm} (id={cluster_id})\n")
         lines.append("⏳ Создаю заявку...")
 
@@ -1421,9 +1422,8 @@ async def handle_back_to_dests(call: CallbackQuery):
 async def handle_create_orders_menu(call: CallbackQuery):
     await call.answer()
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Суперпоставки (тест — Воронеж)", callback_data="super_supply_test")],
+        [InlineKeyboardButton(text="⚡ Суперпоставки (тест — Москва)", callback_data="super_supply_test")],
         [InlineKeyboardButton(text="🚀 Суперпоставки (все кластеры)",   callback_data="super_supply_confirm")],
-        [InlineKeyboardButton(text="🔍 Диагностика кластеров",          callback_data="diagnose_clusters")],
         [InlineKeyboardButton(text="◀️ Главное меню",                   callback_data="main_menu")],
     ])
     await call.message.edit_text(
@@ -1436,7 +1436,7 @@ async def handle_create_orders_menu(call: CallbackQuery):
 @dp.callback_query(F.data == "super_supply_test")
 async def handle_super_supply_test(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("⏳ Запускаю тест: создаю заявку в кластер Воронеж...")
+    await call.message.edit_text("⏳ Запускаю тест: создаю заявку в кластер Москва, МО и Дальние регионы...")
     try:
         result = await run_super_supply_test()
     except Exception as e:
@@ -1476,31 +1476,6 @@ async def handle_super_supply_confirm(call: CallbackQuery):
         reply_markup=kb
     )
 
-
-# ===== ДИАГНОСТИКА КЛАСТЕРОВ =====
-@dp.callback_query(F.data == "diagnose_clusters")
-async def handle_diagnose_clusters(call: CallbackQuery):
-    await call.answer()
-    await call.message.edit_text(
-        "🔍 Проверяю доступные кластеры для СТАВРОПОЛЬ_АППЗ_2...\n"
-        "Это займёт несколько минут (1 запрос в минуту)."
-    )
-    try:
-        result = await run_diagnose_clusters()
-    except Exception as e:
-        logging.exception("diagnose_clusters error")
-        result = f"❌ Ошибка: {e}"
-
-    back_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="◀️ Назад", callback_data="create_orders_menu")],
-        [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
-    ])
-    chunks = [result[i:i + 4000] for i in range(0, len(result), 4000)]
-    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
-    for i, chunk in enumerate(chunks[1:], 1):
-        await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
-    if len(chunks) > 1:
-        await call.message.answer("⬆️ Результат выше", reply_markup=back_kb)
 
 
 # ===== СУПЕРПОСТАВКИ: ЗАПУСК =====
