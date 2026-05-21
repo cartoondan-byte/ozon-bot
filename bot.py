@@ -510,32 +510,13 @@ async def fetch_all_ozon_clusters(session: aiohttp.ClientSession) -> list[dict]:
 
 # ===== СУПЕРПОСТАВКИ: найти точку отгрузки =====
 async def find_drop_off_warehouse(session: aiohttp.ClientSession) -> tuple[int, str]:
-    for supply_type in ["CREATE_TYPE_CROSSDOCK", "CREATE_TYPE_DIRECT"]:
-        try:
-            data = await ozon_post(
-                session,
-                f"{OZON_API_URL}/v1/warehouse/fbo/list",
-                {"filter_by_supply_type": [supply_type], "search": STAVROPOL_WAREHOUSE_NAME}
-            )
-            for wh in data.get("search", []):
-                if STAVROPOL_WAREHOUSE_NAME.lower() in wh.get("name", "").lower():
-                    return wh["warehouse_id"], supply_type
-        except Exception as e:
-            logging.warning(f"warehouse/fbo/list ({supply_type}): {e}")
-
-    # Fallback: ищем по частичному совпадению
-    data = await ozon_post(
-        session,
-        f"{OZON_API_URL}/v1/warehouse/fbo/list",
-        {"filter_by_supply_type": ["CREATE_TYPE_DIRECT"], "search": "СТАВРОПОЛЬ"}
-    )
-    results = data.get("search", [])
-    if results:
-        wh = results[0]
-        logging.warning(f"Точное совпадение не найдено, берём: {wh.get('name')}")
-        return wh["warehouse_id"], "CREATE_TYPE_DIRECT"
-
-    raise Exception(f"Точка отгрузки '{STAVROPOL_WAREHOUSE_NAME}' не найдена!")
+    """
+    Тип поставки DIRECT — Ozon сам забирает товар со склада продавца.
+    drop_off_point_warehouse_id не нужен для DIRECT.
+    Возвращаем (0, "CREATE_TYPE_DIRECT").
+    """
+    logging.info("Тип поставки: CREATE_TYPE_DIRECT (Доставит Ozon)")
+    return 0, "CREATE_TYPE_DIRECT"
 
 
 # ===== СУПЕРПОСТАВКИ: получить Super-товары =====
@@ -610,10 +591,9 @@ async def find_best_timeslot(session: aiohttp.ClientSession,
         session,
         f"{OZON_API_URL}/v1/draft/timeslot/info",
         {
-            "draft_id":      draft_id,
-            "date_from":     date_from.strftime("%Y-%m-%dT00:00:00Z"),
-            "date_to":       date_to.strftime("%Y-%m-%dT23:59:59Z"),
-            "warehouse_ids": [str(drop_off_wh_id)],
+            "draft_id":  draft_id,
+            "date_from": date_from.strftime("%Y-%m-%dT00:00:00Z"),
+            "date_to":   date_to.strftime("%Y-%m-%dT23:59:59Z"),
         }
     )
 
@@ -677,8 +657,7 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
             "items":       [{"sku": sku, "quantity": 5}],
             "type":        supply_type,
         }
-        if supply_type == "CREATE_TYPE_CROSSDOCK":
-            payload["drop_off_point_warehouse_id"] = drop_off_wh_id
+        # DROP_OFF не нужен для CREATE_TYPE_DIRECT
 
         logging.info(f"draft/create payload: {json.dumps(payload, ensure_ascii=False)}")
         resp = await ozon_post_draft(session, f"{OZON_API_URL}/v1/draft/create", payload)
