@@ -764,9 +764,10 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
         "sku_name":  sku_name,
         "qty":       5,
         "success":   False,
-        "order_id":  None,
-        "timeslot":  "",
-        "error":     "",
+        "order_id":     None,
+        "order_number": "",
+        "timeslot":     "",
+        "error":        "",
     }
 
     try:
@@ -893,12 +894,27 @@ async def create_supply_for_cluster(session: aiohttp.ClientSession,
         if not order_id:
             raise Exception(f"order_id не получен: {status_data}")
 
+        # Получить order_number (человекочитаемый номер вида 2000053199049)
+        order_number = str(order_id)  # fallback
+        try:
+            detail = await ozon_post(
+                session,
+                f"{OZON_API_URL}/v3/supply-order/get",
+                {"order_ids": [order_id]}
+            )
+            orders_list = detail.get("orders", [])
+            if orders_list:
+                order_number = orders_list[0].get("order_number", str(order_id))
+        except Exception as e:
+            logging.warning(f"Не удалось получить order_number: {e}")
+
         # Форматируем слот для отображения (строки уже в часовом поясе склада)
         ts_str = f"{ts_from[:16]} – {ts_to[:16]}"
 
-        result["success"]  = True
-        result["order_id"] = order_id
-        result["timeslot"] = ts_str
+        result["success"]      = True
+        result["order_id"]     = order_id
+        result["order_number"] = order_number
+        result["timeslot"]     = ts_str
 
     except Exception as e:
         logging.exception(f"create_supply_for_cluster {cluster_name_str}: {e}")
@@ -962,12 +978,13 @@ async def run_super_supply_test() -> str:
     lines.append("")
     if res["success"]:
         lines.append(f"✅ Заявка создана!")
-        lines.append(f"   Кластер:  {res['cluster']}")
-        lines.append(f"   SKU:      {res['sku']}")
-        lines.append(f"   Товар:    {res['sku_name'][:60]}")
-        lines.append(f"   Кол-во:   {res['qty']} шт")
-        lines.append(f"   Слот:     {res['timeslot']}")
-        lines.append(f"   Order ID: {res['order_id']}")
+        lines.append(f"🔢 Заявка №{res['order_number'] or res['order_id']}")
+        lines.append("")
+        lines.append(f"   Кластер: {res['cluster']}")
+        lines.append(f"   Товар:   {res['sku_name'][:60]}")
+        lines.append(f"   SKU:     {res['sku']}")
+        lines.append(f"   Кол-во:  {res['qty']} шт")
+        lines.append(f"   Слот:    {res['timeslot']}")
     else:
         lines.append(f"❌ Заявка НЕ создана в кластер {res['cluster']}")
         lines.append(f"   Ошибка: {res['error']}")
@@ -1035,9 +1052,9 @@ async def run_super_supply_all() -> str:
             if res["success"]:
                 results.append(
                     f"✅ {cluster_nm}\n"
-                    f"   SKU: {res['sku']} | {res['sku_name'][:40]}\n"
-                    f"   Кол-во: {res['qty']} шт | {res['timeslot']}\n"
-                    f"   Order ID: {res['order_id']}"
+                    f"   🔢 Заявка №{res['order_number'] or res['order_id']}\n"
+                    f"   Товар: {res['sku_name'][:40]}\n"
+                    f"   Кол-во: {res['qty']} шт | {res['timeslot']}"
                 )
             else:
                 errors.append(
