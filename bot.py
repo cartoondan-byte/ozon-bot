@@ -40,13 +40,7 @@ SUPER_PRODUCT_TAG = "super"   # фильтр по названию/тегу Supe
 # Узнать свой ID: напишите боту /myid
 # Установите переменную окружения ADMIN_ID=ваш_telegram_id
 ADMIN_IDS: set[int]     = {int(os.environ.get("ADMIN_ID", "0"))}
-ALLOWED_USERS: set[int] = set()  # управляется через /add и /remove; хранится в Railway Variables
-
-# Railway API для обновления переменной ALLOWED_USERS
-RAILWAY_TOKEN          = os.environ.get("RAILWAY_TOKEN", "")
-RAILWAY_PROJECT_ID     = os.environ.get("RAILWAY_PROJECT_ID", "")
-RAILWAY_SERVICE_ID     = os.environ.get("RAILWAY_SERVICE_ID", "")
-RAILWAY_ENVIRONMENT_ID = os.environ.get("RAILWAY_ENVIRONMENT_ID", "production")
+ALLOWED_USERS: set[int] = set()  # загружается из переменной ALLOWED_USERS при старте
 
 def _load_allowed_users() -> None:
     """Загружает список из переменной окружения ALLOWED_USERS=id1,id2,id3"""
@@ -60,43 +54,6 @@ def _load_allowed_users() -> None:
                 ids.add(int(part))
         ALLOWED_USERS = ids
         logging.info(f"Загружено {len(ALLOWED_USERS)} пользователей из ALLOWED_USERS")
-
-async def _save_allowed_users() -> bool:
-    """Обновляет переменную ALLOWED_USERS в Railway через GraphQL API."""
-    if not all([RAILWAY_TOKEN, RAILWAY_PROJECT_ID, RAILWAY_SERVICE_ID]):
-        logging.warning("Railway API не настроен — ALLOWED_USERS не сохранены в Variables")
-        return False
-    value = ",".join(str(uid) for uid in sorted(ALLOWED_USERS))
-    query = """
-    mutation variableUpsert($input: VariableUpsertInput!) {
-        variableUpsert(input: $input)
-    }
-    """
-    variables = {
-        "input": {
-            "projectId":     RAILWAY_PROJECT_ID,
-            "serviceId":     RAILWAY_SERVICE_ID,
-            "environmentId": RAILWAY_ENVIRONMENT_ID,
-            "name":          "ALLOWED_USERS",
-            "value":         value,
-        }
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                "https://backboard.railway.app/graphql/v2",
-                headers={"Authorization": f"Bearer {RAILWAY_TOKEN}", "Content-Type": "application/json"},
-                json={"query": query, "variables": variables}
-            ) as resp:
-                data = await resp.json()
-                if data.get("errors"):
-                    logging.warning(f"Railway API error: {data['errors']}")
-                    return False
-                logging.info(f"ALLOWED_USERS сохранён в Railway: {value}")
-                return True
-    except Exception as e:
-        logging.warning(f"Ошибка Railway API: {e}")
-        return False
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -1254,9 +1211,10 @@ async def cmd_add(message: types.Message):
         return
     uid = int(parts[1])
     ALLOWED_USERS.add(uid)
-    saved = await _save_allowed_users()
-    note = "" if saved else "\n⚠️ Railway API не настроен — после перезапуска пользователь сбросится."
-    await message.answer(f"✅ Пользователь {uid} добавлен.{note}")
+    await message.answer(
+        f"✅ Пользователь {uid} добавлен.\n"
+        f"⚠️ Чтобы сохранить навсегда — добавьте {uid} в переменную ALLOWED_USERS в Railway."
+    )
 
 
 @dp.message(F.text.startswith("/remove"))
@@ -1271,9 +1229,10 @@ async def cmd_remove(message: types.Message):
         return
     uid = int(parts[1])
     ALLOWED_USERS.discard(uid)
-    saved = await _save_allowed_users()
-    note = "" if saved else "\n⚠️ Railway API не настроен — изменение сбросится при перезапуске."
-    await message.answer(f"✅ Пользователь {uid} удалён.{note}")
+    await message.answer(
+        f"✅ Пользователь {uid} удалён.\n"
+        f"⚠️ Чтобы удалить навсегда — уберите {uid} из переменной ALLOWED_USERS в Railway."
+    )
 
 
 @dp.message(F.text.startswith("/users"))
