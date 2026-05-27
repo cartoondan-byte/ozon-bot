@@ -40,25 +40,63 @@ SUPER_PRODUCT_TAG = "super"   # фильтр по названию/тегу Supe
 # Узнать свой ID: напишите боту /myid
 # Установите переменную окружения ADMIN_ID=ваш_telegram_id
 ADMIN_IDS: set[int]     = {int(os.environ.get("ADMIN_ID", "0"))}
-ALLOWED_USERS_FILE      = "allowed_users.json"
-ALLOWED_USERS: set[int] = set()  # управляется через /add и /remove
+ALLOWED_USERS: set[int] = set()  # управляется через /add и /remove; хранится в Railway Variables
+
+# Railway API для обновления переменной ALLOWED_USERS
+RAILWAY_TOKEN          = os.environ.get("RAILWAY_TOKEN", "")
+RAILWAY_PROJECT_ID     = os.environ.get("RAILWAY_PROJECT_ID", "")
+RAILWAY_SERVICE_ID     = os.environ.get("RAILWAY_SERVICE_ID", "")
+RAILWAY_ENVIRONMENT_ID = os.environ.get("RAILWAY_ENVIRONMENT_ID", "production")
 
 def _load_allowed_users() -> None:
+    """Загружает список из переменной окружения ALLOWED_USERS=id1,id2,id3"""
     global ALLOWED_USERS
-    try:
-        if os.path.exists(ALLOWED_USERS_FILE):
-            with open(ALLOWED_USERS_FILE, "r") as f:
-                ALLOWED_USERS = set(json.load(f))
-            logging.info(f"Загружено {len(ALLOWED_USERS)} пользователей из {ALLOWED_USERS_FILE}")
-    except Exception as e:
-        logging.warning(f"Ошибка загрузки пользователей: {e}")
+    raw = os.environ.get("ALLOWED_USERS", "")
+    if raw:
+        ids = set()
+        for part in raw.split(","):
+            part = part.strip()
+            if part.lstrip("-").isdigit():
+                ids.add(int(part))
+        ALLOWED_USERS = ids
+        logging.info(f"Загружено {len(ALLOWED_USERS)} пользователей из ALLOWED_USERS")
 
-def _save_allowed_users() -> None:
+async def _save_allowed_users() -> bool:
+    """Обновляет переменную ALLOWED_USERS в Railway через GraphQL API."""
+    if not all([RAILWAY_TOKEN, RAILWAY_PROJECT_ID, RAILWAY_SERVICE_ID]):
+        logging.warning("Railway API не настроен — ALLOWED_USERS не сохранены в Variables")
+        return False
+    value = ",".join(str(uid) for uid in sorted(ALLOWED_USERS))
+    query = """
+    mutation variableUpsert($input: VariableUpsertInput!) {
+        variableUpsert(input: $input)
+    }
+    """
+    variables = {
+        "input": {
+            "projectId":     RAILWAY_PROJECT_ID,
+            "serviceId":     RAILWAY_SERVICE_ID,
+            "environmentId": RAILWAY_ENVIRONMENT_ID,
+            "name":          "ALLOWED_USERS",
+            "value":         value,
+        }
+    }
     try:
-        with open(ALLOWED_USERS_FILE, "w") as f:
-            json.dump(list(ALLOWED_USERS), f)
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://backboard.railway.app/graphql/v2",
+                headers={"Authorization": f"Bearer {RAILWAY_TOKEN}", "Content-Type": "application/json"},
+                json={"query": query, "variables": variables}
+            ) as resp:
+                data = await resp.json()
+                if data.get("errors"):
+                    logging.warning(f"Railway API error: {data['errors']}")
+                    return False
+                logging.info(f"ALLOWED_USERS сохранён в Railway: {value}")
+                return True
     except Exception as e:
-        logging.warning(f"Ошибка сохранения пользователей: {e}")
+        logging.warning(f"Ошибка Railway API: {e}")
+        return False
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
@@ -1216,8 +1254,9 @@ async def cmd_add(message: types.Message):
         return
     uid = int(parts[1])
     ALLOWED_USERS.add(uid)
-    _save_allowed_users()
-    await message.answer(f"✅ Пользователь {uid} добавлен в список доступа.")
+    saved = await _save_allowed_users()
+    note = "" if saved else "\n⚠️ Railway API не настроен — после перезапуска пользователь сбросится."
+    await message.answer(f"✅ Пользователь {uid} добавлен.{note}")
 
 
 @dp.message(F.text.startswith("/remove"))
@@ -1232,8 +1271,9 @@ async def cmd_remove(message: types.Message):
         return
     uid = int(parts[1])
     ALLOWED_USERS.discard(uid)
-    _save_allowed_users()
-    await message.answer(f"✅ Пользователь {uid} удалён из списка доступа.")
+    saved = await _save_allowed_users()
+    note = "" if saved else "\n⚠️ Railway API не настроен — изменение сбросится при перезапуске."
+    await message.answer(f"✅ Пользователь {uid} удалён.{note}")
 
 
 @dp.message(F.text.startswith("/users"))
