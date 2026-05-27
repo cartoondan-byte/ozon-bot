@@ -1250,16 +1250,16 @@ async def cmd_users(message: types.Message):
 
 
 # ===== ГЛАВНОЕ МЕНЮ (callback) =====
-@require_auth
 @dp.callback_query(F.data == "main_menu")
+@require_auth
 async def handle_main_menu(call: CallbackQuery):
     await call.answer()
     await call.message.edit_text("Выбери действие:", reply_markup=main_menu())
 
 
 # ===== БЛИЖАЙШИЕ ЗАЯВКИ НА ПЕРЕНОС =====
-@require_auth
 @dp.callback_query(F.data == "show_skus")
+@require_auth
 async def handle_show_skus(call: CallbackQuery):
     await call.answer()
     await call.message.edit_text("⏳ Ищу заявки с датой поставки в ближайшие 5 дней...")
@@ -1352,8 +1352,8 @@ async def handle_show_skus(call: CallbackQuery):
 
 
 # ===== ПЕРЕНОС — ОБРАБОТЧИК =====
-@require_auth
 @dp.callback_query(F.data == "do_reschedule")
+@require_auth
 async def handle_do_reschedule(call: CallbackQuery):
     await call.answer()
 
@@ -1402,8 +1402,8 @@ async def handle_do_reschedule(call: CallbackQuery):
     )
 
 
-@require_auth
 @dp.callback_query(F.data == "confirm_reschedule")
+@require_auth
 async def handle_confirm_reschedule(call: CallbackQuery):
     await call.answer()
     await call.message.edit_text("⏳ Переношу заявки... Это может занять 1-2 минуты.")
@@ -1434,8 +1434,8 @@ async def handle_confirm_reschedule(call: CallbackQuery):
 
 
 # ===== ПЕРЕНОС ЗАЯВОК (callback) =====
-@require_auth
 @dp.callback_query(F.data == "do_reschedule")
+@require_auth
 async def handle_do_reschedule(call: CallbackQuery):
     await call.answer()
     await call.message.edit_text(
@@ -1456,8 +1456,8 @@ async def handle_do_reschedule(call: CallbackQuery):
 
 
 # ===== ЗАЯВКИ — ПОКАЗАТЬ СКЛАДЫ/КЛАСТЕРЫ =====
-@require_auth
 @dp.callback_query(F.data == "show_supplies")
+@require_auth
 async def handle_show_supplies(call: CallbackQuery):
     await call.answer()
     await call.message.edit_text("⏳ Загружаю заявки «Заполнение данных»...\nЭто может занять ~1 мин")
@@ -1481,8 +1481,8 @@ async def handle_show_supplies(call: CallbackQuery):
 
 
 # ===== ВЫБРАН СКЛАД/КЛАСТЕР =====
-@require_auth
 @dp.callback_query(F.data.startswith("dest::"))
+@require_auth
 async def handle_dest_select(call: CallbackQuery):
     await call.answer()
     dest_key = call.data[6:]
@@ -1555,8 +1555,8 @@ async def handle_dest_select(call: CallbackQuery):
 
 
 # ===== НАЗАД К СКЛАДАМ =====
-@require_auth
 @dp.callback_query(F.data == "back_to_dests")
+@require_auth
 async def handle_back_to_dests(call: CallbackQuery):
     await call.answer()
     grouped = _cache.get("grouped", {})
@@ -1577,8 +1577,8 @@ async def handle_back_to_dests(call: CallbackQuery):
 
 
 # ===== МЕНЮ СОЗДАНИЯ ЗАЯВОК =====
-@require_auth
 @dp.callback_query(F.data == "create_orders_menu")
+@require_auth
 async def handle_create_orders_menu(call: CallbackQuery):
     await call.answer()
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1592,8 +1592,8 @@ async def handle_create_orders_menu(call: CallbackQuery):
 
 
 # ===== СУПЕРПОСТАВКИ: ТЕСТ (Воронеж) =====
-@require_auth
 @dp.callback_query(F.data == "super_supply_test")
+@require_auth
 async def handle_super_supply_test(call: CallbackQuery):
     await call.answer()
     await call.message.edit_text("⏳ Запускаю тест: создаю заявку в кластер Воронеж...")
@@ -1617,8 +1617,8 @@ async def handle_super_supply_test(call: CallbackQuery):
 
 
 # ===== СУПЕРПОСТАВКИ: ПОДТВЕРЖДЕНИЕ (все кластеры) =====
-@require_auth
 @dp.callback_query(F.data == "super_supply_confirm")
+@require_auth
 async def handle_super_supply_confirm(call: CallbackQuery):
     await call.answer()
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1641,8 +1641,8 @@ async def handle_super_supply_confirm(call: CallbackQuery):
 
 
 # ===== СУПЕРПОСТАВКИ: ЗАПУСК =====
-@require_auth
 @dp.callback_query(F.data == "super_supply_run")
+@require_auth
 async def handle_super_supply_run(call: CallbackQuery):
     await call.answer()
     back_kb = InlineKeyboardMarkup(inline_keyboard=[
