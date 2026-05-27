@@ -36,6 +36,56 @@ EXCLUDED_CLUSTERS = [
 ]
 SUPER_PRODUCT_TAG = "super"   # фильтр по названию/тегу Super-товаров
 
+# ===== АДМИНИСТРАТОРЫ И АВТОРИЗОВАННЫЕ ПОЛЬЗОВАТЕЛИ =====
+# Узнать свой ID: напишите боту /myid
+# Установите переменную окружения ADMIN_ID=ваш_telegram_id
+ADMIN_IDS: set[int]     = {int(os.environ.get("ADMIN_ID", "0"))}
+ALLOWED_USERS_FILE      = "allowed_users.json"
+ALLOWED_USERS: set[int] = set()  # управляется через /add и /remove
+
+def _load_allowed_users() -> None:
+    global ALLOWED_USERS
+    try:
+        if os.path.exists(ALLOWED_USERS_FILE):
+            with open(ALLOWED_USERS_FILE, "r") as f:
+                ALLOWED_USERS = set(json.load(f))
+            logging.info(f"Загружено {len(ALLOWED_USERS)} пользователей из {ALLOWED_USERS_FILE}")
+    except Exception as e:
+        logging.warning(f"Ошибка загрузки пользователей: {e}")
+
+def _save_allowed_users() -> None:
+    try:
+        with open(ALLOWED_USERS_FILE, "w") as f:
+            json.dump(list(ALLOWED_USERS), f)
+    except Exception as e:
+        logging.warning(f"Ошибка сохранения пользователей: {e}")
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+def is_allowed(user_id: int) -> bool:
+    return user_id in ADMIN_IDS or user_id in ALLOWED_USERS
+
+def require_auth(func):
+    """Декоратор: блокирует доступ неавторизованным пользователям."""
+    import functools
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        obj = args[0] if args else None
+        if isinstance(obj, CallbackQuery):
+            user_id = obj.from_user.id
+            async def deny(): await obj.answer("⛔ Нет доступа.", show_alert=True)
+        elif isinstance(obj, types.Message):
+            user_id = obj.from_user.id
+            async def deny(): await obj.answer("⛔ У вас нет доступа к этому боту.")
+        else:
+            return await func(*args, **kwargs)
+        if not is_allowed(user_id):
+            await deny()
+            return
+        return await func(*args, **kwargs)
+    return wrapper
+
 
 # ===== АДАПТИВНЫЙ RATE LIMITER =====
 _bundle_semaphore = asyncio.Semaphore(3)
@@ -1102,7 +1152,6 @@ async def run_super_supply_all(chat_id: int) -> None:
 # ===== ГЛАВНОЕ МЕНЮ =====
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Ближайшие заявки на перенос", callback_data="show_skus")],
         [InlineKeyboardButton(text="🔄 Перенести ближайшие заявки",  callback_data="do_reschedule")],
         [InlineKeyboardButton(text="🚚 Заявки на поставку",          callback_data="show_supplies")],
         [InlineKeyboardButton(text="➕ Создание заявок",             callback_data="create_orders_menu")],
@@ -1126,6 +1175,14 @@ def dest_menu(grouped: dict) -> InlineKeyboardMarkup:
 # ===== СТАРТ =====
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        await message.answer(
+            f"⛔ У вас нет доступа к этому боту.\n"
+            f"Ваш Telegram ID: `{message.from_user.id}`\n"
+            f"Передайте его администратору для получения доступа.",
+            parse_mode="Markdown"
+        )
+        return
     try:
         await message.delete()
     except Exception:
@@ -1140,7 +1197,61 @@ async def cmd_start(message: types.Message):
     await bot.send_message(chat_id=chat_id, text="Привет! Выбери действие:", reply_markup=main_menu())
 
 
+# ===== КОМАНДЫ АДМИНИСТРАТОРА =====
+@dp.message(F.text.startswith("/myid"))
+async def cmd_myid(message: types.Message):
+    """Показывает Telegram ID — нужен для добавления в список доступа."""
+    await message.answer(f"🆔 Ваш Telegram ID: `{message.from_user.id}`", parse_mode="Markdown")
+
+
+@dp.message(F.text.startswith("/add"))
+async def cmd_add(message: types.Message):
+    """Добавить пользователя. Только для администратора."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только администратор может добавлять пользователей.")
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Использование: /add <user_id>\nПример: /add 123456789")
+        return
+    uid = int(parts[1])
+    ALLOWED_USERS.add(uid)
+    _save_allowed_users()
+    await message.answer(f"✅ Пользователь {uid} добавлен в список доступа.")
+
+
+@dp.message(F.text.startswith("/remove"))
+async def cmd_remove(message: types.Message):
+    """Убрать пользователя из списка доступа. Только для администратора."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только администратор может удалять пользователей.")
+        return
+    parts = message.text.split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Использование: /remove <user_id>")
+        return
+    uid = int(parts[1])
+    ALLOWED_USERS.discard(uid)
+    _save_allowed_users()
+    await message.answer(f"✅ Пользователь {uid} удалён из списка доступа.")
+
+
+@dp.message(F.text.startswith("/users"))
+async def cmd_users(message: types.Message):
+    """Список авторизованных пользователей. Только для администратора."""
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Только администратор.")
+        return
+    lines = ["👥 Авторизованные пользователи:", f"  👑 Админы: {', '.join(str(i) for i in ADMIN_IDS)}"]
+    if ALLOWED_USERS:
+        lines.append(f"  ✅ Разрешённые: {', '.join(str(i) for i in sorted(ALLOWED_USERS))}")
+    else:
+        lines.append("  (нет дополнительных пользователей)")
+    await message.answer("\n".join(lines))
+
+
 # ===== ГЛАВНОЕ МЕНЮ (callback) =====
+@require_auth
 @dp.callback_query(F.data == "main_menu")
 async def handle_main_menu(call: CallbackQuery):
     await call.answer()
@@ -1148,6 +1259,7 @@ async def handle_main_menu(call: CallbackQuery):
 
 
 # ===== БЛИЖАЙШИЕ ЗАЯВКИ НА ПЕРЕНОС =====
+@require_auth
 @dp.callback_query(F.data == "show_skus")
 async def handle_show_skus(call: CallbackQuery):
     await call.answer()
@@ -1241,6 +1353,7 @@ async def handle_show_skus(call: CallbackQuery):
 
 
 # ===== ПЕРЕНОС — ОБРАБОТЧИК =====
+@require_auth
 @dp.callback_query(F.data == "do_reschedule")
 async def handle_do_reschedule(call: CallbackQuery):
     await call.answer()
@@ -1290,6 +1403,7 @@ async def handle_do_reschedule(call: CallbackQuery):
     )
 
 
+@require_auth
 @dp.callback_query(F.data == "confirm_reschedule")
 async def handle_confirm_reschedule(call: CallbackQuery):
     await call.answer()
@@ -1321,6 +1435,7 @@ async def handle_confirm_reschedule(call: CallbackQuery):
 
 
 # ===== ПЕРЕНОС ЗАЯВОК (callback) =====
+@require_auth
 @dp.callback_query(F.data == "do_reschedule")
 async def handle_do_reschedule(call: CallbackQuery):
     await call.answer()
@@ -1342,6 +1457,7 @@ async def handle_do_reschedule(call: CallbackQuery):
 
 
 # ===== ЗАЯВКИ — ПОКАЗАТЬ СКЛАДЫ/КЛАСТЕРЫ =====
+@require_auth
 @dp.callback_query(F.data == "show_supplies")
 async def handle_show_supplies(call: CallbackQuery):
     await call.answer()
@@ -1366,6 +1482,7 @@ async def handle_show_supplies(call: CallbackQuery):
 
 
 # ===== ВЫБРАН СКЛАД/КЛАСТЕР =====
+@require_auth
 @dp.callback_query(F.data.startswith("dest::"))
 async def handle_dest_select(call: CallbackQuery):
     await call.answer()
@@ -1439,6 +1556,7 @@ async def handle_dest_select(call: CallbackQuery):
 
 
 # ===== НАЗАД К СКЛАДАМ =====
+@require_auth
 @dp.callback_query(F.data == "back_to_dests")
 async def handle_back_to_dests(call: CallbackQuery):
     await call.answer()
@@ -1460,12 +1578,12 @@ async def handle_back_to_dests(call: CallbackQuery):
 
 
 # ===== МЕНЮ СОЗДАНИЯ ЗАЯВОК =====
+@require_auth
 @dp.callback_query(F.data == "create_orders_menu")
 async def handle_create_orders_menu(call: CallbackQuery):
     await call.answer()
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚡ Суперпоставки (тест — Воронеж)", callback_data="super_supply_test")],
-        [InlineKeyboardButton(text="🚀 Суперпоставки (все кластеры)",   callback_data="super_supply_confirm")],
+        [InlineKeyboardButton(text="🚀 Суперпоставки (все кластеры)", callback_data="super_supply_confirm")],
         [InlineKeyboardButton(text="◀️ Главное меню",                   callback_data="main_menu")],
     ])
     await call.message.edit_text(
@@ -1475,6 +1593,7 @@ async def handle_create_orders_menu(call: CallbackQuery):
 
 
 # ===== СУПЕРПОСТАВКИ: ТЕСТ (Воронеж) =====
+@require_auth
 @dp.callback_query(F.data == "super_supply_test")
 async def handle_super_supply_test(call: CallbackQuery):
     await call.answer()
@@ -1499,6 +1618,7 @@ async def handle_super_supply_test(call: CallbackQuery):
 
 
 # ===== СУПЕРПОСТАВКИ: ПОДТВЕРЖДЕНИЕ (все кластеры) =====
+@require_auth
 @dp.callback_query(F.data == "super_supply_confirm")
 async def handle_super_supply_confirm(call: CallbackQuery):
     await call.answer()
@@ -1522,6 +1642,7 @@ async def handle_super_supply_confirm(call: CallbackQuery):
 
 
 # ===== СУПЕРПОСТАВКИ: ЗАПУСК =====
+@require_auth
 @dp.callback_query(F.data == "super_supply_run")
 async def handle_super_supply_run(call: CallbackQuery):
     await call.answer()
@@ -1541,9 +1662,9 @@ async def handle_super_supply_run(call: CallbackQuery):
         await bot.send_message(call.message.chat.id, f"❌ Критическая ошибка: {e}")
 
 
-
 # ===== ЗАПУСК =====
 async def main():
+    _load_allowed_users()
     await dp.start_polling(bot)
 
 
