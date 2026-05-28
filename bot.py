@@ -44,13 +44,13 @@ async def _delete_history(chat_id: int) -> None:
 
 async def _edit(call: CallbackQuery, *args, **kwargs):
     """edit_text + track."""
-    msg = await _edit(call, *args, **kwargs)
+    msg = await call.message.edit_text(*args, **kwargs)
     _track(call.message.chat.id, msg.message_id)
     return msg
 
 async def _answer(call: CallbackQuery, *args, **kwargs):
     """answer + track."""
-    msg = await _answer(call, *args, **kwargs)
+    msg = await call.message.answer(*args, **kwargs)
     _track(call.message.chat.id, msg.message_id)
     return msg
 
