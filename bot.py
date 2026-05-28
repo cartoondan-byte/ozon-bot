@@ -27,6 +27,38 @@ CLUSTER_NAMES: dict = {}
 
 # ===== КЭШ =====
 _cache: dict = {}
+_bot_messages: dict[int, list[int]] = {}  # chat_id -> [message_ids]
+
+def _track(chat_id: int, message_id: int) -> None:
+    """Запоминаем message_id каждого сообщения бота."""
+    _bot_messages.setdefault(chat_id, []).append(message_id)
+
+async def _delete_history(chat_id: int) -> None:
+    """Удаляем все запомненные сообщения бота в этом чате."""
+    ids = _bot_messages.pop(chat_id, [])
+    for mid in ids:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
+
+async def _edit(call: CallbackQuery, *args, **kwargs):
+    """edit_text + track."""
+    msg = await _edit(call, *args, **kwargs)
+    _track(call.message.chat.id, msg.message_id)
+    return msg
+
+async def _answer(call: CallbackQuery, *args, **kwargs):
+    """answer + track."""
+    msg = await _answer(call, *args, **kwargs)
+    _track(call.message.chat.id, msg.message_id)
+    return msg
+
+async def _send(chat_id: int, *args, **kwargs):
+    """send_message + track."""
+    msg = await bot.send_message(chat_id, *args, **kwargs)
+    _track(chat_id, msg.message_id)
+    return msg
 
 # ===== КОНСТАНТЫ ДЛЯ СУПЕРПОСТАВОК =====
 STAVROPOL_WAREHOUSE_NAME = "СТАВРОПОЛЬ_АППЗ_2"
@@ -1148,7 +1180,7 @@ async def run_super_supply_all(chat_id: int) -> None:
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Перенести ближайшие заявки",  callback_data="do_reschedule")],
-        [InlineKeyboardButton(text="🚚 Заявки на поставку",          callback_data="show_supplies")],
+        [InlineKeyboardButton(text="🔍 Поиск заявок",               callback_data="show_supplies")],
         [InlineKeyboardButton(text="➕ Создание заявок",             callback_data="create_orders_menu")],
     ])
 
@@ -1178,18 +1210,17 @@ async def cmd_start(message: types.Message):
             parse_mode="Markdown"
         )
         return
+    chat_id = message.chat.id
+    # Удаляем команду /start
     try:
         await message.delete()
     except Exception:
         pass
-    chat_id    = message.chat.id
-    message_id = message.message_id
-    for mid in range(message_id - 1, max(message_id - 50, 0), -1):
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=mid)
-        except Exception:
-            pass
-    await bot.send_message(chat_id=chat_id, text="Привет! Выбери действие:", reply_markup=main_menu())
+    # Удаляем все запомненные сообщения бота
+    await _delete_history(chat_id)
+    # Отправляем меню и запоминаем его
+    sent = await bot.send_message(chat_id=chat_id, text="Выбери действие:", reply_markup=main_menu())
+    _track(chat_id, sent.message_id)
 
 
 # ===== КОМАНДЫ АДМИНИСТРАТОРА =====
@@ -1254,7 +1285,7 @@ async def cmd_users(message: types.Message):
 @require_auth
 async def handle_main_menu(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("Выбери действие:", reply_markup=main_menu())
+    await _edit(call, "Выбери действие:", reply_markup=main_menu())
 
 
 # ===== БЛИЖАЙШИЕ ЗАЯВКИ НА ПЕРЕНОС =====
@@ -1262,7 +1293,7 @@ async def handle_main_menu(call: CallbackQuery):
 @require_auth
 async def handle_show_skus(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("⏳ Ищу заявки с датой поставки в ближайшие 5 дней...")
+    await _edit(call, "⏳ Ищу заявки с датой поставки в ближайшие 5 дней...")
 
     grouped = _cache.get("grouped")
     if not grouped:
@@ -1270,7 +1301,7 @@ async def handle_show_skus(call: CallbackQuery):
             grouped = await load_all_orders()
             _cache["grouped"] = grouped
         except Exception as e:
-            await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
+            await _edit(call, f"❌ Ошибка:\n{e}", reply_markup=main_menu())
             return
 
     all_orders = [order for orders in grouped.values() for order in orders]
@@ -1294,7 +1325,7 @@ async def handle_show_skus(call: CallbackQuery):
     near_orders.sort(key=lambda x: x[0])
 
     if not near_orders:
-        await call.message.edit_text(
+        await _edit(call, 
             "📭 Заявок с датой поставки в ближайшие 5 дней не найдено.",
             reply_markup=main_menu()
         )
@@ -1344,11 +1375,11 @@ async def handle_show_skus(call: CallbackQuery):
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
 
-    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
+    await _edit(call, chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
     for i, chunk in enumerate(chunks[1:], 1):
-        await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
+        await _answer(call, chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
     if len(chunks) > 1:
-        await call.message.answer("⬆️ Список выше", reply_markup=back_kb)
+        await _answer(call, "⬆️ Список выше", reply_markup=back_kb)
 
 
 # ===== ПЕРЕНОС — ОБРАБОТЧИК =====
@@ -1359,12 +1390,12 @@ async def handle_do_reschedule(call: CallbackQuery):
 
     grouped = _cache.get("grouped")
     if not grouped:
-        await call.message.edit_text("⏳ Загружаю заявки...")
+        await _edit(call, "⏳ Загружаю заявки...")
         try:
             grouped = await load_all_orders()
             _cache["grouped"] = grouped
         except Exception as e:
-            await call.message.edit_text(f"❌ Ошибка загрузки:\n{e}", reply_markup=main_menu())
+            await _edit(call, f"❌ Ошибка загрузки:\n{e}", reply_markup=main_menu())
             return
 
     moscow_tz = MOSCOW_TZ
@@ -1384,7 +1415,7 @@ async def handle_do_reschedule(call: CallbackQuery):
                 pass
 
     if count == 0:
-        await call.message.edit_text(
+        await _edit(call, 
             "📭 Нет заявок DATA_FILLING с датой поставки в ближайшие 5 дней.",
             reply_markup=main_menu()
         )
@@ -1394,7 +1425,7 @@ async def handle_do_reschedule(call: CallbackQuery):
         [InlineKeyboardButton(text=f"✅ Да, перенести {count} заявок", callback_data="confirm_reschedule")],
         [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")],
     ])
-    await call.message.edit_text(
+    await _edit(call, 
         f"🔄 Найдено заявок DATA_FILLING в ближайшие 5 дней: {count}\n\n"
         f"Они будут перенесены на случайную дату +15..+27 дней от сегодня, слот 19:00-20:00 МСК.\n\n"
         f"Продолжить?",
@@ -1406,11 +1437,11 @@ async def handle_do_reschedule(call: CallbackQuery):
 @require_auth
 async def handle_confirm_reschedule(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("⏳ Переношу заявки... Это может занять 1-2 минуты.")
+    await _edit(call, "⏳ Переношу заявки... Это может занять 1-2 минуты.")
 
     grouped = _cache.get("grouped")
     if not grouped:
-        await call.message.edit_text("❌ Данные устарели. Обновите заявки через «Заявки на поставку».",
+        await _edit(call, "❌ Данные устарели. Обновите заявки через «Заявки на поставку».",
                                      reply_markup=main_menu())
         return
 
@@ -1425,12 +1456,12 @@ async def handle_confirm_reschedule(call: CallbackQuery):
     ])
     if len(result) > 4000:
         chunks = [result[i:i+4000] for i in range(0, len(result), 4000)]
-        await call.message.edit_text(chunks[0])
+        await _edit(call, chunks[0])
         for chunk in chunks[1:]:
-            await call.message.answer(chunk)
-        await call.message.answer("⬆️ Готово!", reply_markup=back_kb)
+            await _answer(call, chunk)
+        await _answer(call, "⬆️ Готово!", reply_markup=back_kb)
     else:
-        await call.message.edit_text(result, reply_markup=back_kb)
+        await _edit(call, result, reply_markup=back_kb)
 
 
 # ===== ПЕРЕНОС ЗАЯВОК (callback) =====
@@ -1438,7 +1469,7 @@ async def handle_confirm_reschedule(call: CallbackQuery):
 @require_auth
 async def handle_do_reschedule(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text(
+    await _edit(call, 
         "⏳ Ищу заявки с датой поставки в ближайшие 5 дней и переношу...\n"
         "Это может занять до 1 минуты."
     )
@@ -1452,7 +1483,7 @@ async def handle_do_reschedule(call: CallbackQuery):
     ])
     if len(result) > 4000:
         result = result[:4000] + "\n...(обрезано)"
-    await call.message.edit_text(result, reply_markup=kb)
+    await _edit(call, result, reply_markup=kb)
 
 
 # ===== ЗАЯВКИ — ПОКАЗАТЬ СКЛАДЫ/КЛАСТЕРЫ =====
@@ -1460,21 +1491,21 @@ async def handle_do_reschedule(call: CallbackQuery):
 @require_auth
 async def handle_show_supplies(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("⏳ Загружаю заявки «Заполнение данных»...\nЭто может занять ~1 мин")
+    await _edit(call, "⏳ Загружаю заявки «Заполнение данных»...\nЭто может занять ~1 мин")
 
     try:
         grouped = await load_all_orders()
         _cache["grouped"] = grouped
     except Exception as e:
-        await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
+        await _edit(call, f"❌ Ошибка:\n{e}", reply_markup=main_menu())
         return
 
     if not grouped:
-        await call.message.edit_text("📭 Заявок со статусом «Заполнение данных» нет.", reply_markup=main_menu())
+        await _edit(call, "📭 Заявок со статусом «Заполнение данных» нет.", reply_markup=main_menu())
         return
 
     total = sum(len(v) for v in grouped.values())
-    await call.message.edit_text(
+    await _edit(call, 
         f"🚚 Заявки «Заполнение данных»: {total}\nВыбери склад или кластер:",
         reply_markup=dest_menu(grouped)
     )
@@ -1495,7 +1526,7 @@ async def handle_dest_select(call: CallbackQuery):
             break
 
     if not matched_key:
-        await call.message.edit_text("❌ Данные устарели, нажми «Заявки на поставку» снова.", reply_markup=main_menu())
+        await _edit(call, "❌ Данные устарели, нажми «Заявки на поставку» снова.", reply_markup=main_menu())
         return
 
     orders = grouped[matched_key]
@@ -1547,11 +1578,11 @@ async def handle_dest_select(call: CallbackQuery):
         [InlineKeyboardButton(text="🏠 Главное меню",    callback_data="main_menu")],
     ])
 
-    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
+    await _edit(call, chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
     for i, chunk in enumerate(chunks[1:], 1):
-        await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
+        await _answer(call, chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
     if len(chunks) > 1:
-        await call.message.answer("⬆️ Список выше", reply_markup=back_kb)
+        await _answer(call, "⬆️ Список выше", reply_markup=back_kb)
 
 
 # ===== НАЗАД К СКЛАДАМ =====
@@ -1561,16 +1592,16 @@ async def handle_back_to_dests(call: CallbackQuery):
     await call.answer()
     grouped = _cache.get("grouped", {})
     if not grouped:
-        await call.message.edit_text("⏳ Данные устарели, перезагружаю...")
+        await _edit(call, "⏳ Данные устарели, перезагружаю...")
         try:
             grouped = await load_all_orders()
             _cache["grouped"] = grouped
         except Exception as e:
-            await call.message.edit_text(f"❌ Ошибка:\n{e}", reply_markup=main_menu())
+            await _edit(call, f"❌ Ошибка:\n{e}", reply_markup=main_menu())
             return
 
     total = sum(len(v) for v in grouped.values())
-    await call.message.edit_text(
+    await _edit(call, 
         f"🚚 Заявки «Заполнение данных»: {total}\nВыбери склад или кластер:",
         reply_markup=dest_menu(grouped)
     )
@@ -1585,7 +1616,7 @@ async def handle_create_orders_menu(call: CallbackQuery):
         [InlineKeyboardButton(text="🚀 Суперпоставки (все кластеры)", callback_data="super_supply_confirm")],
         [InlineKeyboardButton(text="◀️ Главное меню",                   callback_data="main_menu")],
     ])
-    await call.message.edit_text(
+    await _edit(call, 
         "➕ Создание заявок\n\nВыбери режим:",
         reply_markup=kb
     )
@@ -1596,7 +1627,7 @@ async def handle_create_orders_menu(call: CallbackQuery):
 @require_auth
 async def handle_super_supply_test(call: CallbackQuery):
     await call.answer()
-    await call.message.edit_text("⏳ Запускаю тест: создаю заявку в кластер Воронеж...")
+    await _edit(call, "⏳ Запускаю тест: создаю заявку в кластер Воронеж...")
     try:
         result = await run_super_supply_test()
     except Exception as e:
@@ -1608,11 +1639,11 @@ async def handle_super_supply_test(call: CallbackQuery):
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
     chunks = [result[i:i + 4000] for i in range(0, len(result), 4000)]
-    await call.message.edit_text(chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
+    await _edit(call, chunks[0], reply_markup=back_kb if len(chunks) == 1 else None)
     for i, chunk in enumerate(chunks[1:], 1):
-        await call.message.answer(chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
+        await _answer(call, chunk, reply_markup=back_kb if i == len(chunks) - 1 else None)
     if len(chunks) > 1:
-        await call.message.answer("⬆️ Результат выше", reply_markup=back_kb)
+        await _answer(call, "⬆️ Результат выше", reply_markup=back_kb)
 
 
 
@@ -1625,7 +1656,7 @@ async def handle_super_supply_confirm(call: CallbackQuery):
         [InlineKeyboardButton(text="✅ Да, создать заявки", callback_data="super_supply_run")],
         [InlineKeyboardButton(text="❌ Отмена",             callback_data="create_orders_menu")],
     ])
-    await call.message.edit_text(
+    await _edit(call, 
         "🚀 Суперпоставки — все кластеры\n\n"
         "Будут созданы заявки во все кластеры OZON кроме:\n"
         "Алматы, Астана, Калининград, Беларусь, Армения, Казахстан, Кыргызстан\n\n"
@@ -1649,7 +1680,7 @@ async def handle_super_supply_run(call: CallbackQuery):
         [InlineKeyboardButton(text="◀️ Назад", callback_data="create_orders_menu")],
         [InlineKeyboardButton(text="🏠 Главное меню", callback_data="main_menu")],
     ])
-    await call.message.edit_text(
+    await _edit(call, 
         "⏳ Запускаю суперпоставки для всех кластеров...\n"
         "Буду присылать сообщение после каждой заявки.",
         reply_markup=back_kb
@@ -1658,7 +1689,7 @@ async def handle_super_supply_run(call: CallbackQuery):
         await run_super_supply_all(call.message.chat.id)
     except Exception as e:
         logging.exception("super_supply_run error")
-        await bot.send_message(call.message.chat.id, f"❌ Критическая ошибка: {e}")
+        await _send(call.message.chat.id, f"❌ Критическая ошибка: {e}")
 
 
 # ===== ЗАПУСК =====
